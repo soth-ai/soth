@@ -535,7 +535,6 @@ pub struct ExtensionsConfig {
     pub code: CodeExtensionConfig,
 }
 
-
 /// Historian extension config. Backfills + watches local AI-tool history
 /// (Cursor, Claude Code, Gemini CLI, ...) and enriches it with classify.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -843,7 +842,6 @@ pub struct CodeClassifyConfig {
     pub run_mode: ClassifyRunMode,
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClassifyRunMode {
@@ -945,7 +943,6 @@ pub struct CodeAgentConfig {
     /// adapters.
     pub enabled: bool,
 }
-
 
 pub fn default_config_path() -> PathBuf {
     dirs::home_dir()

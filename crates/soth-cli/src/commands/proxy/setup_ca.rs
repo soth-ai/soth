@@ -164,13 +164,9 @@ fn generate_ca_files(cert_path: &Path, key_path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(key_path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| {
-                format!(
-                    "failed setting 0600 permissions on {}",
-                    key_path.display()
-                )
-            })?;
+        std::fs::set_permissions(key_path, std::fs::Permissions::from_mode(0o600)).with_context(
+            || format!("failed setting 0600 permissions on {}", key_path.display()),
+        )?;
     }
     Ok(())
 }

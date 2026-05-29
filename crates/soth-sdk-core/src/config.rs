@@ -156,7 +156,6 @@ pub enum BundleSource {
     Fallback,
 }
 
-
 /// Top-level SDK configuration. Construct via [`SdkConfigBuilder`].
 pub struct SdkConfig {
     pub api_key: String,

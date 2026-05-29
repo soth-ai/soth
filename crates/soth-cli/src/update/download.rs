@@ -106,9 +106,7 @@ pub async fn download_binary(
     let actual = hex::encode(hasher.finalize());
     if !actual.eq_ignore_ascii_case(expected_sha256) {
         let _ = tokio::fs::remove_file(&sink.stage_path).await;
-        bail!(
-            "sha256 mismatch: expected {expected_sha256}, got {actual} (binary discarded)",
-        );
+        bail!("sha256 mismatch: expected {expected_sha256}, got {actual} (binary discarded)",);
     }
 
     if let Some(total) = content_length {

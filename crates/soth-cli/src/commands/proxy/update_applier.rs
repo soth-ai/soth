@@ -372,9 +372,7 @@ fn spawn_finish_staged_helper(
 }
 
 async fn countdown(secs: u64) {
-    eprintln!(
-        "Restarting soth in {secs} seconds. Press Ctrl-C in the daemon to abort."
-    );
+    eprintln!("Restarting soth in {secs} seconds. Press Ctrl-C in the daemon to abort.");
     let interval = if secs >= 5 { secs / 5 } else { 1 };
     let mut remaining = secs;
     while remaining > 0 {

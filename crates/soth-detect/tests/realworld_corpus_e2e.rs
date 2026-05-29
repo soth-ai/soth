@@ -263,7 +263,6 @@ fn realworld_provider_corpus_model_extraction() {
         );
     }
 
-
     assert!(
         tested >= 20,
         "expected at least 20 testable providers, got {tested}"

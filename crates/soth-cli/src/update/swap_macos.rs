@@ -306,9 +306,7 @@ async fn wait_for_listener_or_log(timeout: Duration) -> Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    bail!(
-        "daemon did not bind 127.0.0.1:{port} within {timeout:?} after swap"
-    );
+    bail!("daemon did not bind 127.0.0.1:{port} within {timeout:?} after swap");
 }
 
 fn read_configured_port() -> Option<u16> {

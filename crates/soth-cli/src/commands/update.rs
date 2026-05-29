@@ -100,9 +100,7 @@ pub async fn run_check(
             "update available: {} → {} (channel {})",
             current, manifest.version, manifest.channel
         );
-        println!(
-            "  but no platform entry for '{plat}' — manual download required"
-        );
+        println!("  but no platform entry for '{plat}' — manual download required");
         return Ok(UpdateStatus::UpdateAvailable);
     }
     let entry = entry.unwrap();
@@ -200,9 +198,7 @@ pub async fn run_apply(
         tracing::warn!(error = %e, "post-swap healthcheck failed; rolling back");
         if let Err(rb) = swapper.rollback().await {
             mark_pending_apply_failed(&format!("apply+rollback: {e:#}"));
-            bail!(
-                "apply failed AND rollback failed: apply={e:#}; rollback={rb:#}"
-            );
+            bail!("apply failed AND rollback failed: apply={e:#}; rollback={rb:#}");
         }
         mark_pending_apply_failed(&format!("post-swap rolled back: {e:#}"));
         bail!("apply failed: {e:#}; rolled back to previous binary");
@@ -320,9 +316,7 @@ pub async fn run_finish_staged(
         tracing::warn!(error = %e, "post-swap healthcheck failed; rolling back");
         if let Err(rb) = swapper.rollback().await {
             mark_pending_apply_failed(&format!("apply+rollback (helper): {e:#}"));
-            bail!(
-                "apply failed AND rollback failed: apply={e:#}; rollback={rb:#}"
-            );
+            bail!("apply failed AND rollback failed: apply={e:#}; rollback={rb:#}");
         }
         mark_pending_apply_failed(&format!("post-swap rolled back (helper): {e:#}"));
         bail!("apply failed: {e:#}; rolled back to previous binary");

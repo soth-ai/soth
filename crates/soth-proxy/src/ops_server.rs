@@ -150,7 +150,10 @@ async fn require_loopback_host(
     let host_name = host_name.trim_start_matches('[').trim_end_matches(']');
     let is_loopback = matches!(host_name, "127.0.0.1" | "localhost" | "::1");
     if !is_loopback {
-        tracing::warn!(host = host, "rejected ops request with non-loopback Host header");
+        tracing::warn!(
+            host = host,
+            "rejected ops request with non-loopback Host header"
+        );
         return (StatusCode::FORBIDDEN, "forbidden_host\n").into_response();
     }
     next.run(req).await
@@ -598,7 +601,10 @@ mod tests {
         let first = super::generate_or_load_token(&path).unwrap();
         assert_eq!(first.len(), 64, "token should be 32 bytes hex-encoded");
         let second = super::generate_or_load_token(&path).unwrap();
-        assert_eq!(first, second, "second load should reuse the persisted token");
+        assert_eq!(
+            first, second,
+            "second load should reuse the persisted token"
+        );
 
         // Permissions must be 0600 on Unix.
         #[cfg(unix)]

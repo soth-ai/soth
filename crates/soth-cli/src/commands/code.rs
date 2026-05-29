@@ -1369,9 +1369,7 @@ fn run_stats(args: StatsArgs) -> Result<()> {
         }
     }
     println!();
-    println!(
-        "decisions: {allow_count} allow, {block_count} block, {error_count} error"
-    );
+    println!("decisions: {allow_count} allow, {block_count} block, {error_count} error");
     Ok(())
 }
 
@@ -1400,7 +1398,5 @@ fn print_audit_row(agent: &str, entry: Option<&cli_config::HistorianAdapterAudit
         ),
         None => ("no", "—", ""),
     };
-    println!(
-        "  {agent:<14} {audited:<8} {audited_at:<30} {caveats}"
-    );
+    println!("  {agent:<14} {audited:<8} {audited_at:<30} {caveats}");
 }
