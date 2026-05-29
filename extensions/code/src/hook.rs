@@ -83,6 +83,27 @@ pub fn run_hook(
     let adapter =
         adapter::for_agent(agent_name).ok_or_else(|| HookError::UnknownAgent(agent_name.into()))?;
 
+    // Cursor honors Claude Code's hook-protocol contract: when Cursor's
+    // AI integration runs, it reads BOTH ~/.cursor/hooks.json AND
+    // ~/.claude/settings.json, firing two hook subprocesses per action.
+    // The cursor-side invocation already produces a canonical event;
+    // skip the claude_code duplicate when an ancestor process is Cursor.
+    // Standalone `claude` CLI invocations (Cursor not in the parent chain)
+    // continue to fire normally.
+    if agent_name == "claude_code" && ancestor_chain_includes_cursor() {
+        let decision = HookDecision::Allow;
+        let response = adapter.render_decision(&decision);
+        tracing::debug!(
+            hook_type = hook_type,
+            "soth-code: claude_code hook invoked by Cursor; skipping enqueue (cursor sibling will own the event)"
+        );
+        return Ok(HookOutcome {
+            event_id: Uuid::nil(),
+            decision,
+            exit_code: response.exit_code(),
+        });
+    }
+
     // 1. parse — adapter produces a CodeEvent.  Strip a leading
     //    UTF-8 BOM defensively before handing to the adapter so
     //    every parse path benefits regardless of how stdin was
@@ -105,7 +126,7 @@ pub fn run_hook(
 
     // 2. detect — scan payload for credential shapes, produce
     //    SensitiveArtifact per match. Same model the proxy uses.
-    //    Detection NEVER mutates the payload (matches proxy
+    //    Detection NEVER mutates the payload (gryph PR #40 / proxy
     //    semantics): mutation would be a policy decision
     //    (`PolicyDecisionKind::Redact`), not the detector's.
     let detect_start = std::time::Instant::now();
@@ -305,8 +326,8 @@ pub fn run_hook(
     //    decision is authoritative: Rego/CEL rules can Block, Allow,
     //    Redact, Reroute, Flag based on classify outputs + artifacts.
     //    When no bundle is loaded, fall through to the artifact-
-    //    driven default-deny — silent fail-open is the failure mode
-    //    we explicitly avoid, encoded as a security-tool default.
+    //    driven default-deny — gryph Issue #20's silent fail-open
+    //    lesson, encoded as a security-tool default.
     let policy_start = std::time::Instant::now();
     let (mut decision, mut policy) = match policy_bundle() {
         Some(bundle) => {
@@ -421,9 +442,10 @@ pub fn run_hook(
 /// Strips a leading UTF-8 BOM (`0xEF 0xBB 0xBF`) before returning.
 /// Cursor on Windows (Electron-based child_process.spawn) prepends a
 /// BOM to JSON stdin; serde_json doesn't tolerate it and rejects the
-/// payload as `expected value at line 1 column 1`.  The latent bug
-/// is upstream-wide: most reporters run macOS / Linux Cursor builds
-/// where the BOM doesn't appear. Strip defensively
+/// payload as `expected value at line 1 column 1`.  gryph upstream
+/// has the identical latent bug — it just hasn't bitten them because
+/// most reporters run macOS / Linux Cursor builds where the BOM
+/// doesn't appear (filed for upstream as well).  Strip defensively
 /// here in the common entry point so every adapter benefits, not
 /// just Cursor.  Costs nothing when no BOM is present.
 pub fn read_stdin_to_end() -> Result<Vec<u8>, io::Error> {
@@ -439,6 +461,37 @@ fn strip_utf8_bom(buf: Vec<u8>) -> Vec<u8> {
     } else {
         buf
     }
+}
+
+/// Detect whether this hook subprocess was invoked by Cursor (the IDE
+/// honoring Claude Code's hook-protocol contract) rather than by the
+/// standalone `claude` CLI.
+///
+/// Cursor reads BOTH `~/.cursor/hooks.json` AND `~/.claude/settings.json`
+/// when its AI integration runs, so a single user action fires two
+/// soth-code hook subprocesses — one as `--agent cursor`, one as
+/// `--agent claude_code` — with identical content. Returns `true` if
+/// any ancestor process in the chain is Cursor; callers use this to
+/// drop the duplicate `--agent claude_code` event.
+fn ancestor_chain_includes_cursor() -> bool {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+    let mut system = System::new();
+    system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+    let mut pid = Pid::from(std::process::id() as usize);
+    for _ in 0..8 {
+        let Some(proc) = system.process(pid) else {
+            return false;
+        };
+        let name = proc.name().to_string_lossy().to_ascii_lowercase();
+        if name.starts_with("cursor") {
+            return true;
+        }
+        let Some(parent) = proc.parent() else {
+            return false;
+        };
+        pid = parent;
+    }
+    false
 }
 
 fn governable_from_code_event(ev: &CodeEvent) -> GovernableEvent {
@@ -457,6 +510,21 @@ fn governable_from_code_event(ev: &CodeEvent) -> GovernableEvent {
     metadata.insert("agent".to_string(), ev.agent.clone());
     metadata.insert("hook_type".to_string(), ev.hook_type.clone());
     metadata.insert("data_source".to_string(), data_source.into());
+
+    // Attribute every code-extension event to a "<agent>-app" tool so the
+    // cloud's CH_TOOL_NAME_EXPR resolves a real name on dashboards like
+    // /view?domain=engineering instead of falling through to 'unknown'.
+    // Both keys are needed: `tool_identity_key` is what makes
+    // TelemetryEvent::from_governable synthesize a ProcessResolution at
+    // all; `tool_name` is what populates the ClickHouse
+    // `resolved_tool_name` column that CH_TOOL_NAME_EXPR checks first.
+    // Skip for `code_unknown` so unattributed agents don't pollute the
+    // tool catalog with an "unknown-app" entry.
+    if data_source != "code_unknown" {
+        let tool_app = format!("{}-app", ev.agent);
+        metadata.insert("tool_identity_key".to_string(), tool_app.clone());
+        metadata.insert("tool_name".to_string(), tool_app);
+    }
     if let Some(seq) = ev.action_seq {
         metadata.insert("action_seq".to_string(), seq.to_string());
     }
@@ -593,8 +661,8 @@ fn governable_from_code_event(ev: &CodeEvent) -> GovernableEvent {
         // Anthropic, codex → OpenAI, etc.) map by name. IDE-agnostic
         // agents (cursor / windsurf / opencode) attribute to the IDE
         // itself, not to a backend family inferred from the model
-        // string — the IDE *is* the attribution surface (the
-        // dashboard already treats it as such).
+        // string — the IDE *is* the attribution surface (gryph takes
+        // the same stance: its Event struct has no provider field).
         // The legacy `"code"` placeholder and the model-sniff fallback
         // both leaked through to the dashboard as misleading tiles.
         provider: resolve_provider(&ev.agent, ev.model.as_deref()).into(),
@@ -690,6 +758,28 @@ fn attach_code_detect_metadata(gov: &mut GovernableEvent, meta: &CodeDetectMetad
     }
 }
 
+/// Synthesize a `ClassifySidecar` for per-tool hooks.
+///
+/// `pre_tool_use` / `post_tool_use` payloads are tool args / tool
+/// results — JSON, not natural language.  Running the classify
+/// pipeline on them costs a daemon round-trip and returns Unknown
+/// (`is_ai_call` short-circuits non-NL kinds in
+/// `soth-classify/src/hook_entry.rs:157`).  Instead, we synthesize
+/// a sidecar locally:
+///
+///   * `use_case_label`  — the **tool name** itself ("Bash",
+///     "Read", "Edit") so the dashboard renders one row per tool
+///     call with a deterministic, human-meaningful label.
+///   * `use_case_secondary_label` — canonical `ActionType`
+///     ("FileRead", "CommandExec", …) for grouping multiple tool
+///     names that share an action category.
+///   * `use_case_label_reason` — `pre_tool_call` /
+///     `post_tool_call` so dashboards / rollups can distinguish
+///     synthesized tool rows from real ONNX classifications and
+///     filter pre vs post phase explicitly.
+///   * Numeric scores zeroed (no embedding ran) — prevents
+///     anomaly / complexity rollups from being polluted by
+///     non-NL events.
 /// Pre vs post tool-call hook phase. Stamped as
 /// `UseCaseLabelReason::PreToolCall` / `::PostToolCall` so cloud
 /// rollups can split "tool calls issued" from "tool calls
@@ -727,28 +817,6 @@ fn extract_tool_name(ev: &CodeEvent) -> String {
     format!("{:?}", ev.action_type)
 }
 
-/// Synthesize a `ClassifySidecar` for per-tool hooks.
-///
-/// `pre_tool_use` / `post_tool_use` payloads are tool args / tool
-/// results — JSON, not natural language.  Running the classify
-/// pipeline on them costs a daemon round-trip and returns Unknown
-/// (`is_ai_call` short-circuits non-NL kinds in
-/// `soth-classify/src/hook_entry.rs:157`).  Instead, we synthesize
-/// a sidecar locally:
-///
-///   * `use_case_label`  — the **tool name** itself ("Bash",
-///     "Read", "Edit") so the dashboard renders one row per tool
-///     call with a deterministic, human-meaningful label.
-///   * `use_case_secondary_label` — canonical `ActionType`
-///     ("FileRead", "CommandExec", …) for grouping multiple tool
-///     names that share an action category.
-///   * `use_case_label_reason` — `pre_tool_call` /
-///     `post_tool_call` so dashboards / rollups can distinguish
-///     synthesized tool rows from real ONNX classifications and
-///     filter pre vs post phase explicitly.
-///   * Numeric scores zeroed (no embedding ran) — prevents
-///     anomaly / complexity rollups from being polluted by
-///     non-NL events.
 fn synthesize_tool_call_sidecar(ev: &CodeEvent, phase: ToolHookPhase) -> ClassifySidecar {
     let tool_name = extract_tool_name(ev);
     let reason = match phase {
@@ -786,18 +854,21 @@ fn provider_for_agent(agent: &str) -> Option<&'static str> {
         "claude_code" | "openclaw" => Some("anthropic"),
         "codex" => Some("openai"),
         "gemini_cli" => Some("google"),
-        "pi_agent" => Some("inflection"),
-        // Cursor / Windsurf / OpenCode are multi-provider IDEs — the
-        // agent payload doesn't reveal which backend API was hit, and
-        // model-string sniffing is unreliable (Cursor lifecycle hooks
-        // carry no model, and even when present the model string can
-        // be a custom local route that doesn't match any backend
-        // family). Attribute to the IDE itself: no provider field at
-        // all, only the agent name. The IDE *is* the attribution
-        // surface for these tools.
+        // Multi-provider agents (Cursor / Windsurf / OpenCode / Pi)
+        // attribute to the agent itself, not the downstream LLM.
+        // Even if the underlying call hits Anthropic or OpenAI, the
+        // user-facing source of the event is the agent — that's what
+        // dashboard Feed/Signals should bucket under. The actual
+        // upstream model (if exposed) still lives in the `model`
+        // column for drill-down; this field reflects origin, not
+        // destination. Pi was previously hardcoded to "inflection"
+        // back when it was Inflection's product, but pi v0.74+ is
+        // model-agnostic — defaulting to the legacy provider made
+        // every pi event misattribute to Inflection on the dashboard.
         "cursor" => Some("cursor"),
         "windsurf" => Some("windsurf"),
         "opencode" => Some("opencode"),
+        "pi_agent" => Some("pi_agent"),
         _ => None,
     }
 }
@@ -858,10 +929,12 @@ fn policy_bundle() -> Option<&'static PolicyBundle> {
         }
         if let Some(path) = bundle_path() {
             if path.exists() {
-                // Err falls through to embedded bundle below.
-                if let Ok(bundle) = soth_policy::load_bundle(&path) {
-                    soth_policy::warm(&bundle);
-                    return Some(Box::leak(Box::new(bundle)));
+                match soth_policy::load_bundle(&path) {
+                    Ok(bundle) => {
+                        soth_policy::warm(&bundle);
+                        return Some(Box::leak(Box::new(bundle)));
+                    }
+                    Err(_) => {} // fall through to embedded
                 }
             }
         }
@@ -955,7 +1028,8 @@ fn build_normalized_for_policy(ev: &CodeEvent) -> NormalizedRequest {
 /// Build a `PolicyContext` from a `CodeEvent`. The `semantic` field
 /// carries classify outputs so OPA rules can read
 /// `input.semantic.use_case_label`, `input.semantic.anomaly_score`,
-/// etc.
+/// etc. — which is the SOTH-vs-gryph capability advantage
+/// (docs/gryph/plan.md §10.10).
 fn build_policy_context(ev: &CodeEvent) -> PolicyContext {
     let semantic = ev.classify.as_ref().map(|c| SemanticPolicyContext {
         use_case_label: parse_use_case_label(&c.use_case_label),
@@ -1313,7 +1387,7 @@ fn should_capture_raw(mode: CodeCaptureMode, decision: &HookDecision) -> bool {
 
 /// Insert the raw payload into the GovernableEvent's metadata,
 /// truncated to `capture.max_payload_bytes` so a megabyte-sized MCP
-/// tool response (observed in production at megabyte sizes) doesn't
+/// tool response (gryph PR #32 surfaced this in the wild) doesn't
 /// blow up queue-row size. The truncation marker `…[truncated]` is
 /// appended so the dashboard can render "this was cut" rather than
 /// silently dropping the tail.
@@ -1398,7 +1472,7 @@ fn append_timing_row(path: &Path, timings: &HookTimings) -> std::io::Result<()> 
         create_dir_all(parent)?;
     }
     let mut line = serde_json::to_string(timings)
-        .map_err(std::io::Error::other)?;
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     line.push('\n');
     let mut f = OpenOptions::new().create(true).append(true).open(path)?;
     f.write_all(line.as_bytes())?;
@@ -1514,23 +1588,24 @@ mod tests {
         assert_eq!(provider_for_agent("openclaw"), Some("anthropic"));
         assert_eq!(provider_for_agent("codex"), Some("openai"));
         assert_eq!(provider_for_agent("gemini_cli"), Some("google"));
-        assert_eq!(provider_for_agent("pi_agent"), Some("inflection"));
     }
 
     #[test]
-    fn provider_for_ide_agnostic_agents_is_the_ide_name() {
-        // Cursor / Windsurf / Opencode let the user pick a model from
-        // any provider, but the IDE *is* the attribution surface — the
-        // model string is unreliable (lifecycle hooks carry no model;
-        // custom routes don't match families) and the event data
-        // model has no provider field at all. Attribute to the IDE
-        // itself so the dashboard shows "cursor" instead of
-        // model-string-inferred "anthropic" or the literal "unknown".
+    fn provider_for_agent_attributes_multi_provider_agents_to_themselves() {
+        // Cursor / Windsurf / OpenCode / Pi let the user pick a model
+        // from any provider, so we can't attribute to the downstream
+        // LLM. Instead they bucket under the agent name itself so the
+        // Feed/Signals dashboard groups events by user-facing source.
+        // Pi was previously `Some("inflection")` — that misattributed
+        // every pi event to Inflection's product even when the user
+        // had pi running against openai-codex or anthropic. v0.74+
+        // pi is model-agnostic, so it joins this group.
         assert_eq!(provider_for_agent("cursor"), Some("cursor"));
         assert_eq!(provider_for_agent("windsurf"), Some("windsurf"));
         assert_eq!(provider_for_agent("opencode"), Some("opencode"));
-        // Truly unknown agents still return None so the legacy
-        // model-sniff path remains the last resort.
+        assert_eq!(provider_for_agent("pi_agent"), Some("pi_agent"));
+        // Genuinely unknown agents still return None so resolve_provider
+        // falls back to model-string inference.
         assert_eq!(provider_for_agent("unknown_agent"), None);
         assert_eq!(provider_for_agent(""), None);
     }
@@ -1547,12 +1622,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_provider_attributes_ide_agnostic_to_ide_not_model() {
-        // Regression guard for the "cursor sending events with
-        // anthropic" symptom: with a claude model picked inside
-        // Cursor, the IDE attribution should still surface as
-        // "cursor" so operators can distinguish IDE traffic from
-        // direct-API traffic on the dashboard.
+    fn resolve_provider_uses_agent_name_for_multi_provider_agents() {
+        // Multi-provider agents (cursor/windsurf/opencode/pi) attribute
+        // to themselves regardless of downstream model. The downstream
+        // LLM still appears in the `model` column for drill-down.
         assert_eq!(
             resolve_provider("cursor", Some("claude-opus-4-7")),
             "cursor"
@@ -1562,16 +1635,13 @@ mod tests {
             resolve_provider("opencode", Some("gemini-1.5-pro")),
             "opencode"
         );
-        // Lifecycle hooks (no model) used to land on "unknown" —
-        // now they correctly attribute to the IDE.
-        assert_eq!(resolve_provider("cursor", None), "cursor");
-        assert_eq!(resolve_provider("windsurf", None), "windsurf");
+        assert_eq!(resolve_provider("pi_agent", Some("gpt-5.5")), "pi_agent");
     }
 
     #[test]
-    fn resolve_provider_returns_unknown_only_for_truly_unrecognized() {
-        // Brand-new agents not yet in `provider_for_agent` + an
-        // unmapped model string genuinely have nothing to attribute to.
+    fn resolve_provider_returns_unknown_only_for_genuinely_unknown_agents() {
+        // Truly unknown agent + unmapped model string → "unknown".
+        // Never falls back to the legacy "code" placeholder.
         assert_eq!(
             resolve_provider("brand_new_agent", Some("future-model-x")),
             "unknown"
@@ -1767,6 +1837,7 @@ mod tests {
         }
     }
 
+    #[test]
     #[test]
     fn run_hook_strips_utf8_bom_from_cursor_stdin() {
         // Cursor on Windows (Electron child_process.spawn) prepends
@@ -2028,9 +2099,11 @@ mod tests {
         assert_eq!(provider_for_agent("claude_code"), Some("anthropic"));
         assert_eq!(provider_for_agent("codex"), Some("openai"));
         assert_eq!(provider_for_agent("gemini_cli"), Some("google"));
-        // IDE-agnostic — attribute to the IDE itself, not to a backend
-        // family inferred from the model string.
+        // Multi-provider agents attribute to themselves (see
+        // provider_for_agent_attributes_multi_provider_agents_to_themselves
+        // for full coverage).
         assert_eq!(provider_for_agent("cursor"), Some("cursor"));
+        assert_eq!(provider_for_agent("pi_agent"), Some("pi_agent"));
         assert_eq!(provider_for_agent("unknown_agent"), None);
     }
 
@@ -2533,6 +2606,7 @@ mod tests {
         assert_eq!(action.command, None);
     }
 
+    #[test]
     #[test]
     fn build_action_policy_context_normalizes_windows_backslash_paths() {
         // Windows paths use backslashes
