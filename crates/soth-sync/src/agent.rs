@@ -2091,6 +2091,7 @@ struct HostHardwareDetails {
 ///     and `apply_failed_reason`. Phase 4 wraps that with a counter
 ///     stored alongside in `update_failures.json` so we don't lose the
 ///     count when the offer file is rotated.
+///
 /// Returns None when no failure counter exists yet (most devices).
 fn read_local_apply_failure_count() -> Option<u32> {
     let home = dirs::home_dir()?;

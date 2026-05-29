@@ -14,8 +14,9 @@ use soth_core::PreEmitEvent;
 // ---------------------------------------------------------------------------
 //
 // This trait is compile-time only — used for CLI registration and `soth status`.
-// It is not in any hot path. `run_hook()` in gryph is called directly without
-// going through the trait. `observe_telemetry_event` is called via the broadcast
+// It is not in any hot path. `run_hook()` in the code extension is called
+// directly without going through the trait. `observe_telemetry_event` is
+// called via the broadcast
 // closure (see registry.rs). The trait is the registration mechanism, not the
 // dispatch mechanism for performance-critical paths.
 

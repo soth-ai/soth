@@ -21,6 +21,7 @@ base64 = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 chrono = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 hex = "0.4"
 
 [dev-dependencies]

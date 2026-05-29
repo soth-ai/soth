@@ -3,8 +3,8 @@
 //! **Alpha-gated.** Codex hooks are very young — only 5 hook types
 //! shipped as of rust-codex 0.114.0 (`session_start`,
 //! `pre_tool_use`, `post_tool_use`, `user_prompt_submit`, `stop`).
-//! Schema churn risk is high; gryph upstream's `agent/codex/`
-//! adapter is itself still evolving. This adapter is shipped
+//! Schema churn risk is high; upstream codex hook taxonomy is
+//! itself still evolving. This adapter is shipped
 //! parser-only — `soth code install --target codex` is deferred to
 //! a follow-up commit pending stable upstream config-format
 //! decisions (Codex hooks live in `~/.codex/config.toml` and the
@@ -57,10 +57,10 @@ impl Adapter for CodexAdapter {
             .unwrap_or("")
             .to_string();
         // Codex CLI carries `model` in the top-level hook payload on
-        // every hook (`agent/codex/parser.go:19,140` in gryph) — gryph
-        // only reads it for `session_start`, but the field is in fact
-        // present on PreToolUse / PostToolUse too.  Stamp it on every
-        // event so the dashboard can render per-tool model attribution.
+        // every hook. Upstream parsers only read it for `session_start`,
+        // but the field is in fact present on PreToolUse / PostToolUse
+        // too. Stamp it on every event so the dashboard can render
+        // per-tool model attribution.
         let model = payload
             .get("model")
             .and_then(Value::as_str)
@@ -72,7 +72,7 @@ impl Adapter for CodexAdapter {
     }
 
     fn render_decision(&self, decision: &HookDecision) -> AdapterResponse {
-        // Anthropic-style protocol per gryph's Codex adapter.
+        // Anthropic-style protocol.
         match decision {
             HookDecision::Allow => AdapterResponse::allow(),
             HookDecision::Block { reason, guidance } => {
@@ -204,9 +204,8 @@ mod tests {
 
     #[test]
     fn extract_model_from_top_level_payload() {
-        // Codex CLI carries `model` on every hook (gryph
-        // `agent/codex/parser.go:19`) — pin extraction across
-        // hook types and reject empty strings.
+        // Codex CLI carries `model` on every hook — pin extraction
+        // across hook types and reject empty strings.
         let a = CodexAdapter::new();
         for hook in ["session_start", "pre_tool_use", "post_tool_use"] {
             let body = format!(

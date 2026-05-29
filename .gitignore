@@ -68,9 +68,6 @@ lcov.info
 *.temp
 .cache/
 
-# Documentation (generated)
-docs/
-
 # Local test corpora (machine-specific fixtures)
 crates/*/tests/corpus/
 .cargo/

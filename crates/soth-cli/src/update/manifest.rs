@@ -75,7 +75,7 @@ impl std::str::FromStr for Channel {
         match s {
             "stable" => Ok(Channel::Stable),
             "canary" => Ok(Channel::Canary),
-            other => bail!("unknown channel '{}' (expected stable|canary)", other),
+            other => bail!("unknown channel '{other}' (expected stable|canary)"),
         }
     }
 }
@@ -145,7 +145,7 @@ pub async fn fetch_and_verify_manifest(
         Some(v) => format!("{}/manifest/{}.v{}.json", base, channel.as_str(), v),
         None => format!("{}/manifest/{}.json", base, channel.as_str()),
     };
-    let sig_url = format!("{}.sig", manifest_url);
+    let sig_url = format!("{manifest_url}.sig");
 
     let client = reqwest::Client::builder()
         .timeout(FETCH_TIMEOUT)
@@ -156,9 +156,9 @@ pub async fn fetch_and_verify_manifest(
         .get(&manifest_url)
         .send()
         .await
-        .with_context(|| format!("fetching {}", manifest_url))?
+        .with_context(|| format!("fetching {manifest_url}"))?
         .error_for_status()
-        .with_context(|| format!("manifest fetch returned non-2xx: {}", manifest_url))?
+        .with_context(|| format!("manifest fetch returned non-2xx: {manifest_url}"))?
         .bytes()
         .await
         .context("reading manifest body")?;
@@ -167,9 +167,9 @@ pub async fn fetch_and_verify_manifest(
         .get(&sig_url)
         .send()
         .await
-        .with_context(|| format!("fetching {}", sig_url))?
+        .with_context(|| format!("fetching {sig_url}"))?
         .error_for_status()
-        .with_context(|| format!("signature fetch returned non-2xx: {}", sig_url))?
+        .with_context(|| format!("signature fetch returned non-2xx: {sig_url}"))?
         .bytes()
         .await
         .context("reading signature body")?;
@@ -252,7 +252,7 @@ pub fn verify_manifest_bytes_with_pubkey(
         .as_deref()
         .unwrap_or(env!("CARGO_PKG_VERSION"));
     let current = Version::parse(current_str)
-        .with_context(|| format!("local CARGO_PKG_VERSION '{}' is not semver", current_str))?;
+        .with_context(|| format!("local CARGO_PKG_VERSION '{current_str}' is not semver"))?;
     let min_supported = Version::parse(&manifest.min_supported_version).with_context(|| {
         format!(
             "manifest min_supported_version '{}' is not semver",
@@ -261,9 +261,7 @@ pub fn verify_manifest_bytes_with_pubkey(
     })?;
     if current < min_supported {
         bail!(
-            "this client (v{}) is below min_supported_version v{}; manual upgrade required",
-            current,
-            min_supported
+            "this client (v{current}) is below min_supported_version v{min_supported}; manual upgrade required"
         );
     }
 
@@ -308,7 +306,7 @@ fn verify_signature_with_pem(
 
     verifying_key
         .verify(manifest_bytes, &signature)
-        .map_err(|e| anyhow!("ed25519 verify failed: {}", e))
+        .map_err(|e| anyhow!("ed25519 verify failed: {e}"))
 }
 
 /// Parse an `-----BEGIN PUBLIC KEY-----` PEM containing an ed25519
@@ -316,7 +314,7 @@ fn verify_signature_with_pem(
 /// to avoid pulling in another PEM parsing crate.
 fn parse_pem_pubkey(pem: &str) -> Result<VerifyingKey> {
     use ed25519_dalek::pkcs8::DecodePublicKey;
-    VerifyingKey::from_public_key_pem(pem.trim()).map_err(|e| anyhow!("PEM parse: {}", e))
+    VerifyingKey::from_public_key_pem(pem.trim()).map_err(|e| anyhow!("PEM parse: {e}"))
 }
 
 /// Map (target_os, target_arch) at compile-time → manifest platform key.
@@ -364,12 +362,8 @@ mod tests {
         min_supported: &str,
     ) -> Vec<u8> {
         let body = format!(
-            r#"{{"channel":"{ch}","min_supported_version":"{ms}","platforms":{{"darwin-arm64":{{"sha256":"abc","url":"https://example/x"}},"darwin-amd64":{{"sha256":"def","url":"https://example/y"}},"linux-amd64":{{"sha256":"ghi","url":"https://example/z"}},"linux-arm64":{{"sha256":"jkl","url":"https://example/w"}},"windows-amd64":{{"sha256":"mno","url":"https://example/v"}}}},"release_notes_url":"https://example/notes","release_seq":{seq},"released_at":"2026-05-11T00:00:00Z","schema_version":1,"version":"{ver}"}}
+            r#"{{"channel":"{channel}","min_supported_version":"{min_supported}","platforms":{{"darwin-arm64":{{"sha256":"abc","url":"https://example/x"}},"darwin-amd64":{{"sha256":"def","url":"https://example/y"}},"linux-amd64":{{"sha256":"ghi","url":"https://example/z"}},"linux-arm64":{{"sha256":"jkl","url":"https://example/w"}},"windows-amd64":{{"sha256":"mno","url":"https://example/v"}}}},"release_notes_url":"https://example/notes","release_seq":{release_seq},"released_at":"2026-05-11T00:00:00Z","schema_version":1,"version":"{version}"}}
 "#,
-            ch = channel,
-            ms = min_supported,
-            ver = version,
-            seq = release_seq,
         );
         body.into_bytes()
     }
@@ -388,8 +382,7 @@ mod tests {
                 || k == "linux-arm64"
                 || k == "windows-amd64"
                 || k == "unsupported",
-            "got {}",
-            k
+            "got {k}"
         );
     }
 
@@ -437,8 +430,8 @@ mod tests {
         };
         let err =
             verify_manifest_bytes_with_pubkey(&tampered, &sig, &pem, "stable", &opts).unwrap_err();
-        let msg = format!("{:#}", err);
-        assert!(msg.contains("signature verification failed"), "got {}", msg);
+        let msg = format!("{err:#}");
+        assert!(msg.contains("signature verification failed"), "got {msg}");
     }
 
     #[test]
@@ -453,8 +446,8 @@ mod tests {
         };
         let err =
             verify_manifest_bytes_with_pubkey(&body, &sig, &pem, "canary", &opts).unwrap_err();
-        let msg = format!("{:#}", err);
-        assert!(msg.contains("does not match"), "got {}", msg);
+        let msg = format!("{err:#}");
+        assert!(msg.contains("does not match"), "got {msg}");
     }
 
     #[test]
@@ -472,7 +465,7 @@ mod tests {
             &VerifyOptions::default(),
         )
         .unwrap_err();
-        assert!(format!("{:#}", err).contains("schema_version 99"));
+        assert!(format!("{err:#}").contains("schema_version 99"));
     }
 
     #[test]
@@ -489,7 +482,7 @@ mod tests {
         };
         let err =
             verify_manifest_bytes_with_pubkey(&body, &sig, &pem, "stable", &opts).unwrap_err();
-        assert!(format!("{:#}", err).contains("anti-rollback"));
+        assert!(format!("{err:#}").contains("anti-rollback"));
 
         // last_release_seq = 5, force_downgrade = true; should accept.
         let opts = VerifyOptions {
@@ -523,7 +516,7 @@ mod tests {
         };
         let err =
             verify_manifest_bytes_with_pubkey(&body, &sig, &pem, "stable", &opts).unwrap_err();
-        assert!(format!("{:#}", err).contains("min_supported_version"));
+        assert!(format!("{err:#}").contains("min_supported_version"));
     }
 
     #[test]
@@ -539,6 +532,6 @@ mod tests {
             &VerifyOptions::default(),
         )
         .unwrap_err();
-        assert!(format!("{:#}", err).contains("signature length"));
+        assert!(format!("{err:#}").contains("signature length"));
     }
 }

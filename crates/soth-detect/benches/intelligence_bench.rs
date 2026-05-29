@@ -103,8 +103,7 @@ fn build_request(content: &str) -> RawRequest {
         path: "/v1/chat/completions".to_string(),
         headers,
         body: Bytes::from(format!(
-            "{{\"model\":\"gpt-4o\",\"messages\":[{{\"role\":\"user\",\"content\":\"{}\"}}]}}",
-            content
+            "{{\"model\":\"gpt-4o\",\"messages\":[{{\"role\":\"user\",\"content\":\"{content}\"}}]}}"
         )),
         connection_meta: ConnectionMeta {
             connection_id: Uuid::new_v4(),

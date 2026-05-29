@@ -42,8 +42,8 @@ make release-classify ENV=staging                          # auto VERSION
 make release-classify ENV=prod VERSION=v1-2026-04-29-hotfix
 ```
 
-Source: `~/labterminal/soth/data/classify/` (manifest.json + 5 model
-files). The build step packs the directory into a gzip-compressed tar
+Source: `$DATA_DIR/classify/` (defaults to `~/.soth/release-data/classify/`;
+manifest.json + 5 model files). The build step packs the directory into a gzip-compressed tar
 at `dist/classify-$VERSION.tar.gz` — exactly the format the admin upload
 handler expects (`crates/soth-api/src/handlers/bundles.rs:72`). Publish
 POSTs the tarball to `$ADMIN_API/v1/admin/classify/upload?version=…`
@@ -76,7 +76,7 @@ Three sub-verbs because each has different cross-env behavior:
 - **`import-catalog`** — refreshes the server's `raw_bundle.json`
   source-of-truth (read by `POST /admin/registry/import/current` from
   a server-side path, NOT request body). On staging, this scp's
-  `~/labterminal/soth/data/raw_bundle.json` → `/opt/soth/soth-cloud/data/runtime/local-bundle/registry/raw_bundle.json`
+  `$DATA_DIR/raw_bundle.json` → `$STAGING_RAW_BUNDLE_PATH` on `$STAGING_SSH_HOST`
   via the ubuntu user, then `sudo -u soth cp` into the deploy tree, then
   POSTs `/import/current`. **On prod, this is not directly supported**:
   Railway containers don't expose a writable filesystem from outside, so

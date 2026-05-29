@@ -3,7 +3,7 @@ use criterion::{criterion_group, criterion_main, Criterion};
 fn bench_classify_fallback(c: &mut Criterion) {
     let bundle = soth_classify::ClassifyBundle::fallback();
     let config = soth_classify::ClassifyConfig::default();
-    let detect_result = soth_detect::DetectResult::filtered();
+    let detect_result = soth_core::DetectResult::default();
 
     let proxy_ctx = soth_core::ProxyContext {
         identity: soth_core::IdentityContext {

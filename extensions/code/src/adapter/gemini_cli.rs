@@ -3,11 +3,10 @@
 //! Hook payloads are very close to Claude Code's (Gemini reuses the
 //! Anthropic-conventional `tool_input`/`tool_response` shape) but with
 //! its own pre-action hook event names (`before_tool_*`,
-//! `after_tool_*`). The biggest gryph-forensics lesson here is PR #29:
-//! the `details` field on some hooks was typed as `string` upstream
-//! but Gemini sends a structured object — defensively typed access
-//! to the few fields we narrow on, full payload preserved on the
-//! event for telemetry.
+//! `after_tool_*`). The most important gotcha: the `details` field on
+//! some hooks was typed as `string` upstream but Gemini actually sends
+//! a structured object — defensively typed access to the few fields we
+//! narrow on, full payload preserved on the event for telemetry.
 
 use serde_json::Value;
 use soth_classify::HookContentKind;
@@ -54,8 +53,8 @@ impl Adapter for GeminiCliAdapter {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        // Gemini CLI's hook payload does NOT carry a model field
-        // (gryph leaves Model empty for this agent).  Best-effort
+        // Gemini CLI's hook payload does NOT carry a model field.
+        // Best-effort
         // fallback: read `~/.gemini/settings.json`'s `model` value
         // (Gemini's CLI persists the active model there) or the
         // `GEMINI_MODEL` env var.  Best-effort — failure here keeps
@@ -212,6 +211,7 @@ fn tool_to_action(tool_name: &str) -> ActionType {
 /// 1. `GEMINI_MODEL` env var (CI/dev override).
 /// 2. `~/.gemini/settings.json` `model` field — Gemini CLI's
 ///    persistent active-model record.
+///
 /// All failures swallowed; the hook just sets `model = None` and
 /// the dashboard renders "unknown" for that event.
 fn extract_model_fallback() -> Option<String> {
@@ -248,9 +248,9 @@ mod tests {
 
     #[test]
     fn details_field_can_be_object_per_pr29() {
-        // gryph PR #29: real Gemini sends `details` as an object
-        // even though docs typed it as string. Defensive parsing
-        // means the adapter doesn't crash on either shape.
+        // Real Gemini sends `details` as an object even though docs
+        // typed it as string. Defensive parsing means the adapter
+        // doesn't crash on either shape.
         let a = GeminiCliAdapter::new();
         let p = br#"{
             "session_id":"s",

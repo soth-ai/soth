@@ -1,0 +1,40 @@
+name: Feature request
+description: Suggest a new feature or improvement
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion. Please describe the problem first, then
+        the proposed solution. We may push back on scope or suggest alternatives —
+        please don't take that personally.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: |
+        Describe the use case, not the implementation. What can't you do today?
+      placeholder: I want to block traffic to specific model versions per agent, but the policy DSL only matches on host...
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: What would the feature look like? Include CLI examples or config snippets if relevant.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What else did you try or consider? Why didn't they work?
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Links, screenshots, related issues, prior art in other tools.

@@ -3,7 +3,7 @@
 //! Pi Agent uses Anthropic-conventional hook payloads but with a
 //! flatter shape than Claude Code: tool args under `input`
 //! (not `tool_input`), `tool_call_id` instead of `tool_use_id`. Pre-
-//! action hooks block via exit-2 + stderr reason (gryph PR #22). Pi
+//! action hooks block via exit-2 + stderr reason. Pi
 //! Agent ships its hook configuration via a TS plugin file
 //! (`~/.config/piagent/plugins/`); install for that surface is
 //! deferred to a follow-up Phase-3 commit — the parser ships now so
@@ -70,9 +70,9 @@ impl Adapter for PiAgentAdapter {
     }
 
     fn render_decision(&self, decision: &HookDecision) -> AdapterResponse {
-        // Pi Agent contract per gryph PR #22: stderr trimmed reason +
-        // exit 2 on Block. JSON-on-stdout shape isn't supported by
-        // older Pi Agent versions, so we stay with the simple form.
+        // Pi Agent contract: stderr trimmed reason + exit 2 on Block.
+        // JSON-on-stdout shape isn't supported by older Pi Agent
+        // versions, so we stay with the simple form.
         match decision {
             HookDecision::Allow => AdapterResponse::allow(),
             HookDecision::Block { reason, .. } => AdapterResponse {

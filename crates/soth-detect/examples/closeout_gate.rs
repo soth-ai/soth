@@ -191,6 +191,7 @@ fn parse_source_name(out: &DetectResult) -> String {
         ParseSource::AgentApp => "agent_app".to_string(),
         ParseSource::Heuristic => "heuristic".to_string(),
         ParseSource::Filtered => "filtered".to_string(),
+        ParseSource::Sdk => "sdk".to_string(),
     }
 }
 

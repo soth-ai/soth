@@ -16,8 +16,9 @@
 //! - Quarantine xattr (`com.apple.quarantine`) is cleared best-effort —
 //!   most curl-installed binaries don't have it, but downloads through
 //!   Safari/Finder will.
-
-#![cfg(target_os = "macos")]
+//!
+//! Gated at the `mod swap_macos;` declaration in update/mod.rs by
+//! `#[cfg(target_os = "macos")]`; no inner cfg needed here.
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
@@ -54,7 +55,7 @@ impl MacosSwapper {
             .and_then(|n| n.to_str())
             .unwrap_or("soth")
             .to_string();
-        p.set_file_name(format!("{}.previous", name));
+        p.set_file_name(format!("{name}.previous"));
         p
     }
 }
@@ -78,7 +79,7 @@ impl Swapper for MacosSwapper {
         // bootstrapped, this returns non-zero with a benign "service not
         // found" message — we tolerate that.
         let uid = unsafe { libc::getuid() };
-        let target = format!("gui/{}/{}", uid, LAUNCHD_LABEL);
+        let target = format!("gui/{uid}/{LAUNCHD_LABEL}");
         let out = Command::new("launchctl")
             .arg("bootout")
             .arg(&target)
@@ -180,7 +181,7 @@ impl Swapper for MacosSwapper {
             );
             return Ok(());
         }
-        let target_domain = format!("gui/{}", uid);
+        let target_domain = format!("gui/{uid}");
         let out = Command::new("launchctl")
             .arg("bootstrap")
             .arg(&target_domain)
@@ -216,7 +217,7 @@ impl Swapper for MacosSwapper {
                 .and_then(|n| n.to_str())
                 .unwrap_or("soth")
                 .to_string();
-            failed.set_file_name(format!("{}.failed", name));
+            failed.set_file_name(format!("{name}.failed"));
             let _ = tokio::fs::remove_file(&failed).await;
             tokio::fs::rename(&self.install_path, &failed)
                 .await
@@ -240,7 +241,7 @@ fn launch_agent_plist_path() -> Result<PathBuf> {
     Ok(home
         .join("Library")
         .join("LaunchAgents")
-        .join(format!("{}.plist", LAUNCHD_LABEL)))
+        .join(format!("{LAUNCHD_LABEL}.plist")))
 }
 
 /// Wait for the proxy port to be unbound — i.e. for the previous
@@ -305,11 +306,7 @@ async fn wait_for_listener_or_log(timeout: Duration) -> Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    bail!(
-        "daemon did not bind 127.0.0.1:{} within {:?} after swap",
-        port,
-        timeout
-    );
+    bail!("daemon did not bind 127.0.0.1:{port} within {timeout:?} after swap");
 }
 
 fn read_configured_port() -> Option<u16> {

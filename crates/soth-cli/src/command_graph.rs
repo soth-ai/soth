@@ -92,7 +92,7 @@ pub enum Commands {
     },
 
     /// Synchronous policy gate at the AI coding agent's hook boundary
-    /// (Claude Code, Cursor, Codex, …). See `docs/gryph/plan.md`.
+    /// (Claude Code, Cursor, Codex, …).
     Code {
         #[command(subcommand)]
         action: commands::code::CodeCommands,
@@ -552,9 +552,11 @@ async fn run_update_command(args: UpdateArgs) -> anyhow::Result<()> {
                     &pending.offer.url,
                     &pending.offer.version,
                 ) {
-                    eprintln!(
-                        "using pending offer: {} (release_seq={}) from {}",
-                        pending.offer.version, pending.offer.release_seq, base,
+                    tracing::info!(
+                        version = %pending.offer.version,
+                        release_seq = pending.offer.release_seq,
+                        base = %base,
+                        "using pending offer"
                     );
                     manifest_url = Some(base);
                     version = Some(pending.offer.version);
@@ -1122,7 +1124,7 @@ fn install_one(agent: &str, settings_path: &Path) -> anyhow::Result<()> {
             .map(|_| ())
             .context("install opencode plugin"),
         // OpenClaw deliberately omitted from the auto-installer
-        // — config format pending upstream (gryph PR #31).
+        // — upstream config format is still in flux.
         other => anyhow::bail!("auto-install does not support agent: {other}"),
     }
 }

@@ -63,7 +63,10 @@ struct BundleModelClassifier {
 
 enum ClassifierModel {
     Linear(LinearClassifier),
-    SothBinary(SothBinaryClassifier),
+    // SothBinary is ~330 bytes (multiple Vec<Vec<f32>>); Linear is ~70 bytes.
+    // Box the large variant so every ClassifierModel doesn't pay the full
+    // size — fixes clippy::large_enum_variant.
+    SothBinary(Box<SothBinaryClassifier>),
 }
 
 struct LinearClassifier {
@@ -573,7 +576,7 @@ fn parse_classifier_soth_binary(
 
     Some(BundleModelClassifier {
         bundle_version,
-        model: ClassifierModel::SothBinary(SothBinaryClassifier {
+        model: ClassifierModel::SothBinary(Box::new(SothBinaryClassifier {
             hidden1_weights,
             hidden1_biases,
             hidden2_weights,
@@ -586,7 +589,7 @@ fn parse_classifier_soth_binary(
             auxiliary_weights,
             auxiliary_biases,
             auxiliary_labels,
-        }),
+        })),
     })
 }
 

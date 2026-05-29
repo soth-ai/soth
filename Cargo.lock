@@ -4051,6 +4051,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -4396,6 +4397,7 @@ dependencies = [
  "soth-telemetry",
  "sqlite-vec",
  "tar",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "toml",

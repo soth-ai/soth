@@ -43,9 +43,9 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Parser / detect / policy / install tests on Windows — gryph
-  # PR #42's `unzip` Windows-specific bug shipped because there
-  # was no Windows runner in CI. We do ship Windows soth-cli
+  # Parser / detect / policy / install tests on Windows. A prior
+  # `unzip` Windows-specific bug shipped because there was no
+  # Windows runner in CI. We do ship Windows soth-cli
   # binaries (see node-binaries lane), so any Windows-only
   # regression in parser/detect/policy/install code paths must
   # land on a real Windows runner before release.

@@ -907,8 +907,8 @@ pub(crate) fn extract_json_from_binary(payload: &[u8]) -> Vec<String> {
             let mut in_string = false;
             let mut escape = false;
             let mut end = i;
-            for j in i..payload.len() {
-                let b = payload[j];
+            for (offset, &b) in payload[i..].iter().enumerate() {
+                let j = i + offset;
                 if escape {
                     escape = false;
                     continue;

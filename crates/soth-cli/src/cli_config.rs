@@ -59,29 +59,20 @@ pub struct ForwardProxyConfig {
     pub max_in_flight_bytes: usize,
     pub max_concurrent_flows: usize,
 
-    // ── soth-code per-agent gating (→ docs/gryph/plan.md §10.11/.12) ──
-    /// **Planned, not yet effective.** User-Agent glob patterns for
-    /// AI coding agents whose traffic should bypass MITM at the proxy
-    /// once the §10.11 A→C trajectory closes for that agent.  Today
-    /// the `audited_bypass_agents` filter validates membership against
-    /// `historian.adapters.<agent>.usage_coverage_audited` and
-    /// `soth code audit-status` reports the result, but **the proxy's
-    /// listener loop does not yet consume this list** — adding an
-    /// entry here is observable in `audit-status` but does not
-    /// actually cause the proxy to bypass that agent.  Wiring lands
-    /// when the bypass-eligibility gate becomes a runtime concern;
-    /// until then this knob is forward-looking config only.
-    /// Default empty.
-    #[serde(default)]
+    // ── EXPERIMENTAL: soth-code per-agent gating (forward-looking) ──
+    //
+    // These two knobs are reserved for future per-agent MITM bypass
+    // and cost-skim routing. They are NOT wired into the proxy listener
+    // loop today — setting them has no runtime effect beyond appearing
+    // in `soth code audit-status`. Hidden from rustdoc and skipped from
+    // serialization when empty so they don't show up in default config
+    // dumps. Will become real configuration when the bypass-eligibility
+    // gate lands at runtime.
+    #[doc(hidden)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bypass_agents: Vec<String>,
-    /// User-Agent glob patterns for agents in **cost-skim** mode: proxy
-    /// emits a narrow event with provider/model/tokens/cost only, no
-    /// classify, no tool-use parsing. Used as a transitional fallback
-    /// for agents whose historian playbook does not yet capture
-    /// authoritative `usage` blocks (plan §10.12). Migrates to
-    /// `bypass_agents` once historian usage coverage is audited.
-    /// Default empty.
-    #[serde(default)]
+    #[doc(hidden)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cost_skim_agents: Vec<String>,
 }
 
@@ -538,18 +529,10 @@ pub struct PipelineOverrides {
 /// extensions can grow knobs without affecting the others.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct ExtensionsConfig {
     pub historian: HistorianExtensionConfig,
     pub code: CodeExtensionConfig,
-}
-
-impl Default for ExtensionsConfig {
-    fn default() -> Self {
-        Self {
-            historian: HistorianExtensionConfig::default(),
-            code: CodeExtensionConfig::default(),
-        }
-    }
 }
 
 /// Historian extension config. Backfills + watches local AI-tool history
@@ -597,8 +580,7 @@ pub struct HistorianExtensionConfig {
     /// Defaults: `claude_code = true` (plan §9 confirmation;
     /// historian's `claude_code` playbook ships with verified
     /// `usage` extraction). All other agents default `false`
-    /// pending the per-agent audit (`docs/gryph/plan.md` §9
-    /// estimates ~1 engineer-day each).
+    /// pending the per-agent audit (~1 engineer-day each).
     ///
     /// Uses an explicit field-default fn rather than
     /// `#[serde(default)]` so that a YAML file containing
@@ -794,9 +776,7 @@ impl Default for HistorianRunMode {
 }
 
 /// `soth-code` extension config. Per-action policy gate at the AI coding
-/// agent's hook boundary (Claude Code, Cursor, Codex, …). See
-/// `docs/gryph/plan.md` §10 for the layer model and §10.11 for the
-/// per-agent A→C trajectory.
+/// agent's hook boundary (Claude Code, Cursor, Codex, …).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CodeExtensionConfig {
@@ -813,13 +793,14 @@ pub struct CodeExtensionConfig {
     ///
     /// `Allow`: failures are logged and the action proceeds. Operator
     /// must accept the visibility risk; surfaces a `WARN` log line on
-    /// every fall-through (gryph Issue #20: silent fail-open is how
-    /// Pi Agent shipped policy enforcement that secretly didn't enforce).
+    /// every fall-through. (Silent fail-open is how earlier policy-
+    /// enforcement implementations shipped enforcement that secretly
+    /// did not enforce — do not opt into Allow lightly.)
     pub on_policy_error: PolicyErrorMode,
 
     /// Hard ceiling for the synchronous hook path. The agent waits this
-    /// long before assuming the hook has hung. Default 30s, matching
-    /// gryph PR #22's chosen value (anything longer freezes the agent).
+    /// long before assuming the hook has hung. Default 30s — anything
+    /// longer freezes the agent UX.
     pub timeout_ms: u32,
 
     /// Per-agent enablement. Agents with no entry default to disabled
@@ -856,16 +837,9 @@ pub struct CodeExtensionConfig {
 /// is dispatched — daemon, in-process, or off entirely.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct CodeClassifyConfig {
     pub run_mode: ClassifyRunMode,
-}
-
-impl Default for CodeClassifyConfig {
-    fn default() -> Self {
-        Self {
-            run_mode: ClassifyRunMode::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -900,8 +874,7 @@ impl Default for ClassifyRunMode {
 
 /// `code.capture` block. See [`CodeCaptureMode`] for semantics; the
 /// `max_payload_bytes` cap protects against megabyte-sized MCP tool
-/// responses (gryph PR #32) blowing up queue-row size when raw
-/// capture is enabled.
+/// responses blowing up queue-row size when raw capture is enabled.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CodeCaptureConfig {
@@ -963,17 +936,12 @@ impl Default for PolicyErrorMode {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct CodeAgentConfig {
     /// Whether the adapter is active. Off-by-default per agent so a
     /// misconfigured `code` block doesn't route through unintended
     /// adapters.
     pub enabled: bool,
-}
-
-impl Default for CodeAgentConfig {
-    fn default() -> Self {
-        Self { enabled: false }
-    }
 }
 
 pub fn default_config_path() -> PathBuf {
@@ -1151,7 +1119,7 @@ mod code_extension_config_tests {
 
     #[test]
     fn code_config_default_matches_documented() {
-        // README example default must match code default — gryph Issue #41
+        // README example default must match code default — a prior bug
         // shipped because docs claimed `minimal` log level was default while
         // code default was `standard`. Pin the contract here.
         let c = CodeExtensionConfig::default();
@@ -1289,12 +1257,14 @@ forward_proxy:
         // claude_code passes audit post-fix; the others stay
         // dropped.  Operator who wires up bypass for the full
         // set sees only `claude-cli/*` engage.
-        let mut proxy = ForwardProxyConfig::default();
-        proxy.bypass_agents = vec![
-            "claude-cli/*".to_string(),
-            "cursor/*".to_string(),
-            "windsurf-extension/*".to_string(),
-        ];
+        let proxy = ForwardProxyConfig {
+            bypass_agents: vec![
+                "claude-cli/*".to_string(),
+                "cursor/*".to_string(),
+                "windsurf-extension/*".to_string(),
+            ],
+            ..ForwardProxyConfig::default()
+        };
         let historian = HistorianExtensionConfig::default();
         let (allowed, dropped) = proxy.audited_bypass_agents(&historian);
         assert_eq!(allowed, vec!["claude-cli/*"]);
@@ -1311,8 +1281,10 @@ forward_proxy:
         // claude-cli/* pass the filter even though the default
         // is false.  This is the "I did the audit, here's the
         // evidence" path.
-        let mut proxy = ForwardProxyConfig::default();
-        proxy.bypass_agents = vec!["claude-cli/*".to_string()];
+        let proxy = ForwardProxyConfig {
+            bypass_agents: vec!["claude-cli/*".to_string()],
+            ..ForwardProxyConfig::default()
+        };
         let mut historian = HistorianExtensionConfig::default();
         historian.adapters.insert(
             "claude_code".to_string(),

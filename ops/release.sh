@@ -43,7 +43,7 @@ ENV="${2:-staging}"
 : "${AWS_CA_BUNDLE:=/etc/ssl/cert.pem}"
 
 : "${DIST_DIR:=./dist}"
-: "${DATA_DIR:=$HOME/labterminal/soth/data}"
+: "${DATA_DIR:=$HOME/.soth/release-data}"
 
 # Phase 2 / 3 (admin API)
 : "${PLATFORM_ADMIN_TOKEN:=}"
@@ -1213,9 +1213,13 @@ require_catalog_admin_creds() {
   fi
 }
 
-# Hetzner staging deploy — ssh target + on-disk path.
-STAGING_SSH_HOST="ubuntu@65.108.45.248"
-STAGING_RAW_BUNDLE_PATH="/opt/soth/soth-cloud/data/runtime/local-bundle/registry/raw_bundle.json"
+# Staging deploy — ssh target + on-disk path.
+# Set STAGING_SSH_HOST (e.g. user@host) and STAGING_RAW_BUNDLE_PATH in your
+# environment or ops/.env.staging — both are required for `import-catalog
+# staging` and `compile-catalog`. We deliberately do not bake the staging
+# hostname into the script so this file can ship in the public repo.
+STAGING_SSH_HOST="${STAGING_SSH_HOST:-}"
+STAGING_RAW_BUNDLE_PATH="${STAGING_RAW_BUNDLE_PATH:-/opt/soth/soth-cloud/data/runtime/local-bundle/registry/raw_bundle.json}"
 
 cmd_import_catalog() {
   case "$ENV" in
@@ -1228,6 +1232,7 @@ cmd_import_catalog() {
 
 cmd_import_catalog_staging() {
   require_catalog_admin_creds
+  require_var STAGING_SSH_HOST "set it in ops/.env.staging (e.g. STAGING_SSH_HOST=user@host)"
 
   local src="${DATA_DIR}/raw_bundle.json"
   [ -f "$src" ] || err "missing $src"

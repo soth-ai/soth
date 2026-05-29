@@ -4,7 +4,7 @@
 //! That covers: adapter parse → credential detect → classify (fallback
 //! bundle) → policy decide → enqueue (atomic JSONL append).
 //!
-//! Targets (docs/gryph/plan.md §10.10):
+//! Targets:
 //! - p99 ≤ 50ms cached
 //! - p99 ≤ 100ms cold
 //!
@@ -22,7 +22,7 @@ use soth_code::paths::CodePaths;
 
 /// Three input shapes covering the hot paths the dashboard cares about:
 /// clean tool action (Allow), credential-bearing command (Block),
-/// MCP tool response with a non-trivial array shape (the gryph PR #32
+/// MCP tool response with a non-trivial array shape (a regression
 /// stress case).
 fn inputs() -> Vec<(&'static str, &'static [u8])> {
     vec![
@@ -48,7 +48,14 @@ fn bench_hook_pipeline(c: &mut Criterion) {
     // Warm the classify bundle cache before measuring. Otherwise the
     // first sample in the benchmark would absorb the bundle-load cost
     // and skew the reported p99 upward.
-    let _ = soth_code::run_hook("claude_code", "pre_tool_use", inputs()[0].1, &paths);
+    let capture = soth_code::HookCaptureConfig::default();
+    let _ = soth_code::run_hook(
+        "claude_code",
+        "pre_tool_use",
+        inputs()[0].1,
+        &paths,
+        &capture,
+    );
 
     let mut group = c.benchmark_group("hook_pipeline");
     // Hook subprocess invocations are short-lived; sample a lot for
@@ -66,6 +73,7 @@ fn bench_hook_pipeline(c: &mut Criterion) {
                         black_box("pre_tool_use"),
                         black_box(payload),
                         black_box(&paths),
+                        black_box(&capture),
                     )
                     .expect("hook ok");
                     black_box(outcome.event_id)

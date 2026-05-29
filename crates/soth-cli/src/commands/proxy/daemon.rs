@@ -800,8 +800,8 @@ fn is_soth_daemon_command_line(command: &str) -> bool {
         .filter(|t| !t.is_empty())
         .collect();
 
-    let has_start = tokens.iter().any(|t| *t == "start");
-    let has_daemon_child = tokens.iter().any(|t| *t == "--daemon-child");
+    let has_start = tokens.contains(&"start");
+    let has_daemon_child = tokens.contains(&"--daemon-child");
 
     // The first token is the executable. Be lenient about path/extension
     // shapes (`/usr/local/bin/soth`, `C:\…\soth.exe`, plain `soth`).
@@ -1687,7 +1687,7 @@ mod tests {
     #[test]
     fn executable_path_matches_canonical_unix_layouts() {
         assert!(is_soth_executable_path("/usr/local/bin/soth"));
-        assert!(is_soth_executable_path("/Users/gilfoyle/.local/bin/soth"));
+        assert!(is_soth_executable_path("/Users/jane/.local/bin/soth"));
         assert!(is_soth_executable_path("soth"));
     }
 

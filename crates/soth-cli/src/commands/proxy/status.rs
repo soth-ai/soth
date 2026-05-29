@@ -299,7 +299,7 @@ fn render_update_line() {
                 current, pending.offer.version, urgency,
             );
             if let Some(notes) = &pending.offer.release_notes_url {
-                println!("   Release notes: {}", notes);
+                println!("   Release notes: {notes}");
             }
             println!();
             return;

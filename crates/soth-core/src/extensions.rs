@@ -13,7 +13,6 @@ use crate::normalized::{EndpointType, NormalizedRequest};
 // Standardized keys for `ExtensionContext::metadata`. Constants — not inline
 // string literals — so producers and consumers across crates agree on the
 // canonical name. New keys land here when more than one crate reads them.
-// (→ `docs/gryph/plan.md` §10.6 for the boundary spec.)
 
 /// Agent's own session identifier as carried in the hook payload
 /// (Claude Code's project-hash-derived ID, Cursor's chat thread ID, etc.).
@@ -88,7 +87,7 @@ pub enum ExtensionSource {
     SubscriptionDetector,
     /// Per-action live capture from agent hooks (Claude Code, Cursor, Codex,
     /// …). Distinct from the post-hoc Historian source which reconstructs
-    /// sessions from local file watching. See `docs/gryph/plan.md` §10.
+    /// sessions from local file watching.
     Code,
     Custom(String),
 }

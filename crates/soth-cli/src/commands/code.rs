@@ -1,7 +1,6 @@
 //! `soth code` command family — synchronous policy gate at the AI
-//! coding agent's hook boundary. See `docs/gryph/plan.md` §10 for the
-//! architecture; this module is the CLI surface that the agent's
-//! `spawnSync` invocation ultimately hits.
+//! coding agent's hook boundary. This module is the CLI surface that
+//! the agent's `spawnSync` invocation ultimately hits.
 
 use std::fs;
 use std::io::Write;
@@ -46,7 +45,8 @@ pub enum CodeCommands {
 
     /// Diagnostics: resolved paths, install state, queue size,
     /// adapter availability. Always uses the same path resolver as
-    /// the runtime (gryph PR #37).
+    /// the runtime so doctor output cannot disagree with what the
+    /// hook actually sees at runtime.
     Doctor(DoctorArgs),
 
     /// Print recent action events from the queue file. Defaults to
@@ -284,7 +284,7 @@ fn run_hook(args: HookArgs) -> Result<()> {
             // Group 4+ adapters return per-agent block codes.
             let raw = match &outcome.decision {
                 soth_code::HookDecision::Allow => 0,
-                soth_code::HookDecision::Block { .. } => 2, // gryph PR #22 default
+                soth_code::HookDecision::Block { .. } => 2, // canonical Block exit code
                 soth_code::HookDecision::Error(_) => 1,
             };
             std::process::exit(raw);
@@ -327,7 +327,7 @@ fn run_install(args: InstallArgs) -> Result<()> {
         "openclaw" => anyhow::bail!(
             "OpenClaw install is parser-only — the runtime adapter, classify, \
              and policy paths all work, but the upstream hook-config format \
-             is unstable (gryph PR #31). Configure hooks manually to point \
+             is unstable upstream. Configure hooks manually to point \
              at `soth code hook --agent openclaw --type <hook_type>` and \
              `soth code tail --agent openclaw` will surface them once \
              enabled."
@@ -593,8 +593,9 @@ fn resolve_uninstall_path(
 }
 
 fn run_doctor(args: DoctorArgs) -> Result<()> {
-    // Single-source path resolver — the gryph PR #37 contract.
-    // Doctor must not have its own resolution path that disagrees
+    // Single-source path resolver — the runtime and doctor share
+    // one resolver. Doctor must not have its own resolution path
+    // that disagrees
     // with the runtime hook handler.
     let paths = match args.root {
         Some(root) => CodePaths::from_root(&root),
@@ -664,7 +665,8 @@ fn run_doctor(args: DoctorArgs) -> Result<()> {
         Json,   // settings.json / hooks.json with per-event entries
         Plugin, // single .mjs / .ts file with a marker line
     }
-    let agents: &[(&str, fn() -> Option<PathBuf>, AgentKind)] = &[
+    type AgentEntry = (&'static str, fn() -> Option<PathBuf>, AgentKind);
+    let agents: &[AgentEntry] = &[
         ("claude_code", default_claude_settings_path, AgentKind::Json),
         ("cursor", default_cursor_hooks_path, AgentKind::Json),
         ("openai_codex", default_codex_hooks_path, AgentKind::Json),
@@ -1334,7 +1336,8 @@ fn run_stats(args: StatsArgs) -> Result<()> {
         "stage", "p50_us", "p95_us", "p99_us", "max_us"
     );
     println!("  {}", "-".repeat(56));
-    let stages: &[(&str, fn(&soth_code::hook::HookTimings) -> u64)] = &[
+    type StageEntry = (&'static str, fn(&soth_code::hook::HookTimings) -> u64);
+    let stages: &[StageEntry] = &[
         ("parse", |t| t.parse_us),
         ("detect", |t| t.detect_us),
         ("classify", |t| t.classify_us),
@@ -1343,13 +1346,13 @@ fn run_stats(args: StatsArgs) -> Result<()> {
         ("total", |t| t.total_us),
     ];
     for (name, picker) in stages {
-        let mut samples: Vec<u64> = rows.iter().map(|r| picker(r)).collect();
+        let mut samples: Vec<u64> = rows.iter().map(picker).collect();
         samples.sort_unstable();
         let p50 = percentile(&samples, 50);
         let p95 = percentile(&samples, 95);
         let p99 = percentile(&samples, 99);
         let max = *samples.last().unwrap_or(&0);
-        println!("  {:<12} {:>8} {:>8} {:>8} {:>8}", name, p50, p95, p99, max);
+        println!("  {name:<12} {p50:>8} {p95:>8} {p99:>8} {max:>8}");
     }
 
     // Decision breakdown — operators want to know how many hits
@@ -1366,10 +1369,7 @@ fn run_stats(args: StatsArgs) -> Result<()> {
         }
     }
     println!();
-    println!(
-        "decisions: {} allow, {} block, {} error",
-        allow_count, block_count, error_count
-    );
+    println!("decisions: {allow_count} allow, {block_count} block, {error_count} error");
     Ok(())
 }
 
@@ -1398,8 +1398,5 @@ fn print_audit_row(agent: &str, entry: Option<&cli_config::HistorianAdapterAudit
         ),
         None => ("no", "—", ""),
     };
-    println!(
-        "  {:<14} {:<8} {:<30} {}",
-        agent, audited, audited_at, caveats
-    );
+    println!("  {agent:<14} {audited:<8} {audited_at:<30} {caveats}");
 }

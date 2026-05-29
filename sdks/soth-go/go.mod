@@ -1,4 +1,4 @@
-module github.com/labterminal/soth/sdks/soth-go
+module github.com/soth-ai/soth/sdks/soth-go
 
 go 1.22
 

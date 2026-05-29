@@ -6,12 +6,12 @@
 //! (no other module in this crate is allowed to call `dirs::config_dir()`
 //! / `dirs::home_dir()` directly).
 //!
-//! Why: gryph's bug report PR #37 found that `gryph doctor` and
-//! `gryph uninstall --purge` resolved the DB path one way, while the
-//! runtime writer used a different resolution under XDG env vars on
-//! macOS/Windows. The result was a doctor that reported "DB present"
-//! while the actual writer was elsewhere, and an uninstall that missed
-//! the real DB. Single-source resolution prevents that class of bug.
+//! Why: in earlier implementations the `doctor` and `uninstall --purge`
+//! commands resolved the DB path one way, while the runtime writer used
+//! a different resolution under XDG env vars on macOS/Windows. The
+//! result was a doctor that reported "DB present" while the actual
+//! writer was elsewhere, and an uninstall that missed the real DB.
+//! Single-source resolution prevents that class of bug.
 
 use std::path::{Path, PathBuf};
 
@@ -29,9 +29,8 @@ pub struct CodePaths {
     /// Directory for embedded JS/TS plugin assets shipped to OpenCode and
     /// Pi Agent (written here by `soth code install`).
     pub plugin_dir: PathBuf,
-    /// Directory for large-payload blob storage (Phase 5 follow-up; see
-    /// `docs/gryph/plan.md` §10.12 / §11). Holds responses larger than
-    /// the configured inline threshold.
+    /// Directory for large-payload blob storage (Phase 5 follow-up).
+    /// Holds responses larger than the configured inline threshold.
     pub blob_dir: PathBuf,
     /// Per-host install state file recording which agent hooks
     /// (`claude_code`, `cursor`, …) have been wired by `soth code
