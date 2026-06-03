@@ -216,7 +216,7 @@ fn load_policy_bundle(assets: &HashMap<String, Vec<u8>>) -> Result<Arc<PolicyBun
     } else if let Some(bytes) = assets.get("policy_bundle.json") {
         bytes
     } else {
-        eprintln!("[soth-bundle] WARN: no policy bundle found in assets; using empty fallback");
+        tracing::warn!("no policy bundle found in assets; using empty fallback");
         return Ok(Arc::new(empty_policy_bundle()));
     };
 

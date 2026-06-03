@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/soth-ai/soth/security/advisories/new
+    about: Report a security issue privately. Do not file public issues for vulnerabilities — see SECURITY.md.
+  - name: Question or discussion
+    url: https://github.com/soth-ai/soth/discussions
+    about: Ask a question, share an idea, or discuss usage with the community.

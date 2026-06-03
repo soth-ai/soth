@@ -555,6 +555,11 @@ pub fn merge_and_emit(
 /// that opened this WebSocket; its event is pushed separately.  This
 /// function adds an additional per-turn event so the dashboard can show
 /// one row per assistant response rather than one row per connection.
+// Many-field mutation pattern: this telemetry event needs ~40 fields populated
+// from disparate sources (turn, pending, proxy_ctx). Struct-update syntax
+// would push the whole thing into one ~200-line expression and hurt
+// readability; let the field-by-field assignments stand.
+#[allow(clippy::field_reassign_with_default)]
 pub fn emit_stream_turn(
     connection_id: Uuid,
     turn: &soth_detect::StreamTurn,

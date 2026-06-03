@@ -92,11 +92,15 @@ pub enum Commands {
     },
 
     /// Synchronous policy gate at the AI coding agent's hook boundary
-    /// (Claude Code, Cursor, Codex, …). See `docs/gryph/plan.md`.
+    /// (Claude Code, Cursor, Codex, …).
     Code {
         #[command(subcommand)]
         action: commands::code::CodeCommands,
     },
+
+    /// Check for or apply a soth release update
+    /// (`docs/common/2026-05-09/hot-update-plan.md`)
+    Update(UpdateArgs),
 }
 
 #[derive(Subcommand)]
@@ -271,6 +275,57 @@ pub struct InitArgs {
     /// Output directory
     #[arg(short, long, default_value = "~/.soth")]
     pub output: PathBuf,
+}
+
+#[derive(Args, Clone)]
+pub struct UpdateArgs {
+    /// Channel to query (default: stable). Operators can run --channel
+    /// canary on the same machine to ride pre-stable releases.
+    #[arg(long, default_value = "stable")]
+    pub channel: String,
+
+    /// Just check; don't download or swap (this is the default).
+    #[arg(long, conflicts_with_all = ["apply", "rollback"])]
+    pub check: bool,
+
+    /// Download, verify, and atomically swap to the latest version.
+    #[arg(long, conflicts_with = "rollback")]
+    pub apply: bool,
+
+    /// Restore the previous binary from <install>.previous and restart.
+    #[arg(long)]
+    pub rollback: bool,
+
+    /// Bypass the release_seq anti-rollback gate. Operator escape hatch
+    /// for emergency reverts; refuses to run without --apply.
+    #[arg(long, requires = "apply")]
+    pub force_downgrade: bool,
+
+    /// Pin a specific version. Fetches the frozen per-version manifest
+    /// at <base>/manifest/<channel>.v<version>.json instead of the
+    /// channel-current pointer, so the binary URLs and sha256s in the
+    /// manifest match a real, historical release. Implicitly disables
+    /// the anti-rollback gate (the version pin is itself the explicit
+    /// operator authorization).
+    #[arg(long)]
+    pub version: Option<String>,
+
+    /// Override the manifest base URL. Hidden from --help; used by
+    /// integration tests and ad-hoc operator overrides.
+    #[arg(long, hide = true)]
+    pub manifest_url: Option<String>,
+
+    /// Internal: macOS auto-update helper mode. The daemon spawns
+    /// `soth update --finish-staged` as a detached process so the
+    /// `launchctl bootout` step doesn't kill the in-process auto-
+    /// applier mid-swap. Hidden — operators should use --apply.
+    #[arg(long, hide = true, requires = "staged_path")]
+    pub finish_staged: bool,
+
+    /// Internal: path to the binary already downloaded + sha256-checked
+    /// by the daemon's auto-applier. Only meaningful with --finish-staged.
+    #[arg(long, hide = true)]
+    pub staged_path: Option<PathBuf>,
 }
 
 #[derive(Args, Clone)]
@@ -457,8 +512,65 @@ async fn run_command(command: Commands, global_config: Option<PathBuf>) -> anyho
             // the hook subcommand; `status` does normally return.
             commands::code::run(action, global_config).await?;
         }
+        Commands::Update(args) => {
+            run_update_command(args).await?;
+        }
     }
 
+    Ok(())
+}
+
+async fn run_update_command(args: UpdateArgs) -> anyhow::Result<()> {
+    use crate::update::Channel;
+    let channel: Channel = args.channel.parse()?;
+    if args.rollback {
+        commands::update::run_rollback().await?;
+        return Ok(());
+    }
+    if args.finish_staged {
+        // clap already enforced staged_path is set via `requires`, but
+        // we destructure defensively rather than .unwrap().
+        let staged = args
+            .staged_path
+            .ok_or_else(|| anyhow::anyhow!("--finish-staged requires --staged-path"))?;
+        commands::update::run_finish_staged(channel, staged, args.manifest_url, args.version)
+            .await?;
+        return Ok(());
+    }
+    if args.apply {
+        // Ergonomic shortcut: if the operator runs `soth update --apply`
+        // with no overrides and there's a heartbeat-delivered offer
+        // waiting, fill in --manifest-url + --version from it. Saves
+        // them re-typing what the cloud already told the daemon. The
+        // signed-manifest trust gate still runs against whatever URL we
+        // end up fetching, so this only changes ergonomics, not trust.
+        let mut manifest_url = args.manifest_url;
+        let mut version = args.version;
+        if manifest_url.is_none() && version.is_none() {
+            if let Ok(Some(pending)) = soth_sync::update_pending::read() {
+                if let Some(base) = commands::update::derive_base_url_from_offer(
+                    &pending.offer.url,
+                    &pending.offer.version,
+                ) {
+                    tracing::info!(
+                        version = %pending.offer.version,
+                        release_seq = pending.offer.release_seq,
+                        base = %base,
+                        "using pending offer"
+                    );
+                    manifest_url = Some(base);
+                    version = Some(pending.offer.version);
+                }
+            }
+        }
+        commands::update::run_apply(channel, manifest_url, args.force_downgrade, version).await?;
+        return Ok(());
+    }
+    // default: --check
+    let status = commands::update::run_check(channel, args.manifest_url, args.version).await?;
+    if let crate::commands::update::UpdateStatus::UpdateAvailable = status {
+        std::process::exit(status.exit_code());
+    }
     Ok(())
 }
 
@@ -1012,7 +1124,7 @@ fn install_one(agent: &str, settings_path: &Path) -> anyhow::Result<()> {
             .map(|_| ())
             .context("install opencode plugin"),
         // OpenClaw deliberately omitted from the auto-installer
-        // — config format pending upstream (gryph PR #31).
+        // — upstream config format is still in flux.
         other => anyhow::bail!("auto-install does not support agent: {other}"),
     }
 }

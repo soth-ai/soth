@@ -83,6 +83,27 @@ pub fn run_hook(
     let adapter =
         adapter::for_agent(agent_name).ok_or_else(|| HookError::UnknownAgent(agent_name.into()))?;
 
+    // Cursor honors Claude Code's hook-protocol contract: when Cursor's
+    // AI integration runs, it reads BOTH ~/.cursor/hooks.json AND
+    // ~/.claude/settings.json, firing two hook subprocesses per action.
+    // The cursor-side invocation already produces a canonical event;
+    // skip the claude_code duplicate when an ancestor process is Cursor.
+    // Standalone `claude` CLI invocations (Cursor not in the parent chain)
+    // continue to fire normally.
+    if agent_name == "claude_code" && ancestor_chain_includes_cursor() {
+        let decision = HookDecision::Allow;
+        let response = adapter.render_decision(&decision);
+        tracing::debug!(
+            hook_type = hook_type,
+            "soth-code: claude_code hook invoked by Cursor; skipping enqueue (cursor sibling will own the event)"
+        );
+        return Ok(HookOutcome {
+            event_id: Uuid::nil(),
+            decision,
+            exit_code: response.exit_code(),
+        });
+    }
+
     // 1. parse — adapter produces a CodeEvent.  Strip a leading
     //    UTF-8 BOM defensively before handing to the adapter so
     //    every parse path benefits regardless of how stdin was
@@ -442,6 +463,37 @@ fn strip_utf8_bom(buf: Vec<u8>) -> Vec<u8> {
     }
 }
 
+/// Detect whether this hook subprocess was invoked by Cursor (the IDE
+/// honoring Claude Code's hook-protocol contract) rather than by the
+/// standalone `claude` CLI.
+///
+/// Cursor reads BOTH `~/.cursor/hooks.json` AND `~/.claude/settings.json`
+/// when its AI integration runs, so a single user action fires two
+/// soth-code hook subprocesses — one as `--agent cursor`, one as
+/// `--agent claude_code` — with identical content. Returns `true` if
+/// any ancestor process in the chain is Cursor; callers use this to
+/// drop the duplicate `--agent claude_code` event.
+fn ancestor_chain_includes_cursor() -> bool {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+    let mut system = System::new();
+    system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+    let mut pid = Pid::from(std::process::id() as usize);
+    for _ in 0..8 {
+        let Some(proc) = system.process(pid) else {
+            return false;
+        };
+        let name = proc.name().to_string_lossy().to_ascii_lowercase();
+        if name.starts_with("cursor") {
+            return true;
+        }
+        let Some(parent) = proc.parent() else {
+            return false;
+        };
+        pid = parent;
+    }
+    false
+}
+
 fn governable_from_code_event(ev: &CodeEvent) -> GovernableEvent {
     // Map `CodeEvent.agent` → DataSource variant via metadata
     // (TelemetryEvent::from_governable reads "data_source" string from
@@ -458,6 +510,21 @@ fn governable_from_code_event(ev: &CodeEvent) -> GovernableEvent {
     metadata.insert("agent".to_string(), ev.agent.clone());
     metadata.insert("hook_type".to_string(), ev.hook_type.clone());
     metadata.insert("data_source".to_string(), data_source.into());
+
+    // Attribute every code-extension event to a "<agent>-app" tool so the
+    // cloud's CH_TOOL_NAME_EXPR resolves a real name on dashboards like
+    // /view?domain=engineering instead of falling through to 'unknown'.
+    // Both keys are needed: `tool_identity_key` is what makes
+    // TelemetryEvent::from_governable synthesize a ProcessResolution at
+    // all; `tool_name` is what populates the ClickHouse
+    // `resolved_tool_name` column that CH_TOOL_NAME_EXPR checks first.
+    // Skip for `code_unknown` so unattributed agents don't pollute the
+    // tool catalog with an "unknown-app" entry.
+    if data_source != "code_unknown" {
+        let tool_app = format!("{}-app", ev.agent);
+        metadata.insert("tool_identity_key".to_string(), tool_app.clone());
+        metadata.insert("tool_name".to_string(), tool_app);
+    }
     if let Some(seq) = ev.action_seq {
         metadata.insert("action_seq".to_string(), seq.to_string());
     }
@@ -590,7 +657,15 @@ fn governable_from_code_event(ev: &CodeEvent) -> GovernableEvent {
         source: EventSource::Extension {
             source: ExtensionSource::Code,
         },
-        provider: "code".into(),
+        // Provider attribution: single-provider agents (claude_code →
+        // Anthropic, codex → OpenAI, etc.) map by name. IDE-agnostic
+        // agents (cursor / windsurf / opencode) attribute to the IDE
+        // itself, not to a backend family inferred from the model
+        // string — the IDE *is* the attribution surface (gryph takes
+        // the same stance: its Event struct has no provider field).
+        // The legacy `"code"` placeholder and the model-sniff fallback
+        // both leaked through to the dashboard as misleading tiles.
+        provider: resolve_provider(&ev.agent, ev.model.as_deref()).into(),
         model: ev.model.clone(),
         endpoint_type: EndpointType::Unknown,
         normalized: None,
@@ -768,15 +843,32 @@ fn synthesize_tool_call_sidecar(ev: &CodeEvent, phase: ToolHookPhase) -> Classif
 
 /// Which LLM provider sits behind each agent. Surfaces in
 /// `IdentityContext::declared_provider` so cloud analytics can
-/// segment by provider when classify-on-hook is the only signal.
+/// segment by provider when classify-on-hook is the only signal,
+/// and is also the primary input to `resolve_provider` (which
+/// `governable_from_code_event` uses to populate the wire-level
+/// `provider` field — previously hardcoded to the placeholder
+/// `"code"` and surfaced as a synthetic provider tile on the
+/// engineering models page).
 fn provider_for_agent(agent: &str) -> Option<&'static str> {
     match agent {
-        "claude_code" => Some("anthropic"),
+        "claude_code" | "openclaw" => Some("anthropic"),
         "codex" => Some("openai"),
         "gemini_cli" => Some("google"),
-        // Cursor / Windsurf / OpenCode / Pi Agent are multi-provider —
-        // the agent payload doesn't always reveal which API was hit.
-        // Leave as None and let cloud-side enrichment fill in if it can.
+        // Multi-provider agents (Cursor / Windsurf / OpenCode / Pi)
+        // attribute to the agent itself, not the downstream LLM.
+        // Even if the underlying call hits Anthropic or OpenAI, the
+        // user-facing source of the event is the agent — that's what
+        // dashboard Feed/Signals should bucket under. The actual
+        // upstream model (if exposed) still lives in the `model`
+        // column for drill-down; this field reflects origin, not
+        // destination. Pi was previously hardcoded to "inflection"
+        // back when it was Inflection's product, but pi v0.74+ is
+        // model-agnostic — defaulting to the legacy provider made
+        // every pi event misattribute to Inflection on the dashboard.
+        "cursor" => Some("cursor"),
+        "windsurf" => Some("windsurf"),
+        "opencode" => Some("opencode"),
+        "pi_agent" => Some("pi_agent"),
         _ => None,
     }
 }
@@ -788,6 +880,22 @@ fn provider_for_agent(agent: &str) -> Option<&'static str> {
 /// this means one load per agent action — acceptable since the bundle
 /// loader is small.
 /// Resolve and load the operator's CEL policy bundle.
+///
+/// Resolution order:
+///   1. On-disk signed bundle at `bundle_path()` (operator-installed via
+///      `soth code policy install-default` or `apply`, or — once the
+///      cloud publishes them — automatically synced).
+///   2. **Embedded default bundle** baked into the binary at compile
+///      time from `extensions/code/policies/code-default-rules.json`.
+///
+/// The embedded fallback is the key fix for the
+/// "fresh-install + code-shaped prompt → silent block" regression:
+/// without it, a missing on-disk bundle dropped the hook into the
+/// artifact-default-deny path, which blocked on any CodeBlock artifact
+/// (any prompt containing `{` `}` plus enough special chars). With the
+/// embedded fallback, the hook always evaluates against a real CEL
+/// rule set whose default rules only target genuinely risky shapes
+/// (`rm -rf`, `dd of=/dev/...`, writes to `~/.ssh/` etc.).
 ///
 /// Production path uses a process-wide `OnceLock` cache so the
 /// hook subprocess only pays the bundle-load cost once per
@@ -805,55 +913,84 @@ fn policy_bundle() -> Option<&'static PolicyBundle> {
     #[cfg(test)]
     {
         // In tests, opt-out via `SOTH_CODE_POLICY_BUNDLE_DISABLE=1`
-        // forces None regardless of what's on disk.  No cache
-        // — each test gets a fresh resolution so per-test env
-        // mutations take effect immediately.  The intentional
-        // leak (Box::leak) keeps the &'static contract; tests
-        // run for milliseconds and tear down the process, so
-        // leaked bundles cost nothing.
+        // forces None — bypasses both on-disk AND embedded defaults
+        // so tests that exercise the no-bundle fallback path
+        // (default_deny_from_artifacts) stay deterministic.  No
+        // cache — each call re-resolves so per-test env mutations
+        // take effect immediately.  The intentional leak
+        // (Box::leak) keeps the &'static contract; tests run for
+        // milliseconds and tear down the process, so leaked
+        // bundles cost nothing.
         if std::env::var("SOTH_CODE_POLICY_BUNDLE_DISABLE")
             .map(|v| !v.is_empty())
             .unwrap_or(false)
         {
             return None;
         }
-        let path = bundle_path()?;
-        if !path.exists() {
-            return None;
-        }
-        match soth_policy::load_bundle(&path) {
-            Ok(bundle) => {
-                soth_policy::warm(&bundle);
-                Some(Box::leak(Box::new(bundle)))
+        if let Some(path) = bundle_path() {
+            if path.exists() {
+                match soth_policy::load_bundle(&path) {
+                    Ok(bundle) => {
+                        soth_policy::warm(&bundle);
+                        return Some(Box::leak(Box::new(bundle)));
+                    }
+                    Err(_) => {} // fall through to embedded
+                }
             }
-            Err(_) => None,
         }
+        load_embedded_bundle().map(|b| &*Box::leak(Box::new(b)))
     }
     #[cfg(not(test))]
     {
         static CACHE: OnceLock<Option<PolicyBundle>> = OnceLock::new();
         CACHE
             .get_or_init(|| {
-                let path = bundle_path()?;
-                if !path.exists() {
-                    return None;
-                }
-                match soth_policy::load_bundle(&path) {
-                    Ok(bundle) => {
-                        soth_policy::warm(&bundle);
-                        Some(bundle)
+                if let Some(path) = bundle_path() {
+                    if path.exists() {
+                        match soth_policy::load_bundle(&path) {
+                            Ok(bundle) => {
+                                soth_policy::warm(&bundle);
+                                return Some(bundle);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    bundle_path = %path.display(),
+                                    error = ?e,
+                                    "soth-code: on-disk policy bundle failed to load; \
+                                     falling through to embedded default rule pack"
+                                );
+                            }
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            bundle_path = %path.display(),
-                            error = ?e,
-                            "soth-code: failed to load policy bundle; falling through to artifact default-deny"
-                        );
-                        None
-                    }
                 }
+                load_embedded_bundle()
             })
             .as_ref()
+    }
+}
+
+/// Compile the embedded default rule pack into a `PolicyBundle`.
+///
+/// Returns `None` only if the embedded JSON or one of its rules fails
+/// to compile — both developer errors caught by `cargo test`. A
+/// returned `None` drops the hook into `default_deny_from_artifacts`,
+/// which itself only blocks on credential artifacts (so user prompts
+/// still flow).
+fn load_embedded_bundle() -> Option<PolicyBundle> {
+    match crate::policy_defaults::embedded_default_bundle() {
+        Ok(bundle) => {
+            soth_policy::warm(&bundle);
+            Some(bundle)
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "soth-code: embedded default policy bundle failed to build; \
+                 hook will use credential-only default-deny — install a real \
+                 bundle with `soth code policy install-default`"
+            );
+            None
+        }
     }
 }
 
@@ -1047,37 +1184,42 @@ fn translate_policy_decision(
     (decision, pd)
 }
 
-/// Default-deny when no policy bundle is loaded. Mirrors the Group 4b
-/// behavior — kept here as an explicit branch so the policy-loaded
-/// path doesn't have to repeat the artifact-driven decision logic.
+/// Fallback decision when no policy bundle is loaded — reached only
+/// when *both* the on-disk signed bundle and the embedded default
+/// bundle are unavailable (the embedded path failing means the binary
+/// was built with a malformed `code-default-rules.json`, caught by
+/// `cargo test`), or when a test explicitly forces this path via
+/// `SOTH_CODE_POLICY_BUNDLE_DISABLE=1`.
+///
+/// **Never blocks.** The code extension's default posture is
+/// observational: artifacts (credentials, code blocks, …) are still
+/// recorded in the audit queue, but the agent action proceeds. Only
+/// CEL rules from a loaded policy bundle can produce a Block decision.
+/// This matches the "notify, don't gate" stance an operator expects
+/// from a fresh install — Block on a paste-in is a worse UX than a
+/// missed flag, and the audit trail still surfaces the artifact for
+/// post-hoc review or alerting.
+///
+/// When credential artifacts are present we emit a Flag decision (the
+/// dashboard renders these distinctly from a clean Allow) so an
+/// operator scanning `soth code tail` still sees the credential
+/// detection, just without the agent-side enforcement.
 fn default_deny_from_artifacts(artifacts: &[SensitiveArtifact]) -> (HookDecision, PolicyDecision) {
-    if artifacts.is_empty() {
-        return (
-            HookDecision::Allow,
-            PolicyDecision {
-                kind: PolicyDecisionKind::Allow,
-                matched_rule: None,
-                warnings: Vec::new(),
-                eval_latency_us: 0,
-            },
-        );
-    }
-    let kinds: Vec<String> = artifacts
+    let credential_kinds: Vec<String> = artifacts
         .iter()
         .filter_map(|a| a.credential_kind.clone())
         .collect();
-    let reason = format!("credentials detected ({})", kinds.join(", "));
-    let guidance = "remove credentials from the payload before retrying";
+    let policy_kind = if credential_kinds.is_empty() {
+        PolicyDecisionKind::Allow
+    } else {
+        PolicyDecisionKind::Flag {
+            reason: format!("credentials detected ({})", credential_kinds.join(", ")),
+        }
+    };
     (
-        HookDecision::Block {
-            reason: reason.clone(),
-            guidance: Some(guidance.to_string()),
-        },
+        HookDecision::Allow,
         PolicyDecision {
-            kind: PolicyDecisionKind::Block {
-                status: 403,
-                message: reason,
-            },
+            kind: policy_kind,
             matched_rule: None,
             warnings: Vec::new(),
             eval_latency_us: 0,
@@ -1146,13 +1288,73 @@ fn classify_bundle_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".soth").join("bundle"))
 }
 
+/// Resolve the provider for a code event. Prefers the adapter-based
+/// answer; only sniffs the model id when the agent supports multiple
+/// providers (or is unknown). Replaces the legacy `"code"` placeholder
+/// that was leaking into the dashboard's `provider` column.
+fn resolve_provider(agent: &str, model: Option<&str>) -> &'static str {
+    if let Some(p) = provider_for_agent(agent) {
+        return p;
+    }
+    infer_provider_from_model(model.unwrap_or(""))
+}
+
+/// Best-effort model → provider mapping. Only used as a fallback for
+/// multi-provider IDEs whose `provider_for_agent` returns `None`.
+///
+/// Returns `"unknown"` for empty or unrecognized model strings rather
+/// than the historical `"code"` placeholder — unmapped models surface
+/// as a single auditable "unknown" bucket on the engineering models
+/// page instead of inflating a fake provider tile.
+fn infer_provider_from_model(model: &str) -> &'static str {
+    let m = model.trim().to_ascii_lowercase();
+    if m.is_empty() {
+        return "unknown";
+    }
+    if m.starts_with("claude") {
+        return "anthropic";
+    }
+    if m.starts_with("gpt")
+        || m.starts_with("o1")
+        || m.starts_with("o3")
+        || m.starts_with("o4")
+        || m.starts_with("text-davinci")
+        || m.starts_with("chatgpt")
+    {
+        return "openai";
+    }
+    if m.starts_with("gemini") {
+        return "google";
+    }
+    if m.starts_with("deepseek") {
+        return "deepseek";
+    }
+    if m.starts_with("qwen") {
+        return "qwen";
+    }
+    if m.starts_with("grok") {
+        return "xai";
+    }
+    if m.starts_with("llama") || m.starts_with("meta-llama") {
+        return "meta";
+    }
+    if m.starts_with("mistral") || m.starts_with("mixtral") || m.starts_with("magistral") {
+        return "mistral";
+    }
+    if m.starts_with("command") {
+        return "cohere";
+    }
+    "unknown"
+}
+
 fn data_source_for_agent(agent: &str) -> &'static str {
-    // Snake_case wire form for the seven Code{Agent} DataSource variants.
-    // Unknown agents (e.g. stub testing with arbitrary names) get the
-    // generic "code" tag — TelemetryEvent::from_governable will fail to
-    // map this to a known DataSource and fall back to LiveProxy, which
-    // is acceptable for the smoke path. Group 4+ adapters set the right
-    // tag once they know their canonical agent name.
+    // Snake_case wire form for the eight Code{Agent} DataSource variants.
+    // Unknown agents (mistyped --agent flags, stub adapters, manual
+    // experiments) map to `code_unknown` so the event lands on the
+    // Action layer and surfaces as an audit-worthy "unknown" bucket.
+    // The earlier smoke-friendly fallback to `code_claude_code` silently
+    // mis-attributed unknown-agent events to Claude Code on the
+    // dashboard, which is worse than visibly bucketing them out.
     match agent {
         "claude_code" => "code_claude_code",
         "cursor" => "code_cursor",
@@ -1161,7 +1363,7 @@ fn data_source_for_agent(agent: &str) -> &'static str {
         "windsurf" => "code_windsurf",
         "opencode" => "code_open_code",
         "pi_agent" => "code_pi_agent",
-        _ => "code_claude_code", // smoke-friendly default
+        _ => "code_unknown",
     }
 }
 
@@ -1342,6 +1544,149 @@ pub fn write_outcome(outcome: &HookOutcome) -> Result<(), io::Error> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::Mutex;
+
+    /// Process-global lock for tests that mutate `SOTH_CODE_POLICY_BUNDLE_DISABLE`
+    /// or `SOTH_CODE_POLICY_BUNDLE`. Cargo runs tests in parallel by default,
+    /// so two tests poking the same env var will race — one setting `1` while
+    /// another expects `unset` flips the embedded-bundle fallback off and
+    /// silently breaks the second test's assertions. Acquire this lock for
+    /// the entire body of any test that touches those vars.
+    static POLICY_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn infer_provider_recognizes_known_prefixes() {
+        assert_eq!(infer_provider_from_model("claude-opus-4-7"), "anthropic");
+        assert_eq!(
+            infer_provider_from_model("claude-sonnet-4-5-20251022"),
+            "anthropic",
+        );
+        assert_eq!(infer_provider_from_model("gpt-4o-mini"), "openai");
+        assert_eq!(infer_provider_from_model("gpt-5"), "openai");
+        assert_eq!(infer_provider_from_model("o1-preview"), "openai");
+        assert_eq!(infer_provider_from_model("o3-mini"), "openai");
+        assert_eq!(infer_provider_from_model("chatgpt-4o-latest"), "openai");
+        assert_eq!(infer_provider_from_model("gemini-1.5-pro"), "google");
+        assert_eq!(infer_provider_from_model("deepseek-v3"), "deepseek");
+        assert_eq!(infer_provider_from_model("qwen2.5-coder"), "qwen");
+        assert_eq!(infer_provider_from_model("grok-2"), "xai");
+        assert_eq!(infer_provider_from_model("llama-3.3-70b"), "meta");
+        assert_eq!(infer_provider_from_model("mistral-large"), "mistral");
+        assert_eq!(infer_provider_from_model("command-r-plus"), "cohere");
+    }
+
+    #[test]
+    fn infer_provider_handles_casing_and_whitespace() {
+        assert_eq!(infer_provider_from_model("  Claude-3 "), "anthropic");
+        assert_eq!(infer_provider_from_model("GPT-4O"), "openai");
+        assert_eq!(infer_provider_from_model("Gemini-2.0-Flash"), "google");
+    }
+
+    #[test]
+    fn provider_for_agent_returns_fixed_provider_for_single_provider_agents() {
+        assert_eq!(provider_for_agent("claude_code"), Some("anthropic"));
+        assert_eq!(provider_for_agent("openclaw"), Some("anthropic"));
+        assert_eq!(provider_for_agent("codex"), Some("openai"));
+        assert_eq!(provider_for_agent("gemini_cli"), Some("google"));
+    }
+
+    #[test]
+    fn provider_for_agent_attributes_multi_provider_agents_to_themselves() {
+        // Cursor / Windsurf / OpenCode / Pi let the user pick a model
+        // from any provider, so we can't attribute to the downstream
+        // LLM. Instead they bucket under the agent name itself so the
+        // Feed/Signals dashboard groups events by user-facing source.
+        // Pi was previously `Some("inflection")` — that misattributed
+        // every pi event to Inflection's product even when the user
+        // had pi running against openai-codex or anthropic. v0.74+
+        // pi is model-agnostic, so it joins this group.
+        assert_eq!(provider_for_agent("cursor"), Some("cursor"));
+        assert_eq!(provider_for_agent("windsurf"), Some("windsurf"));
+        assert_eq!(provider_for_agent("opencode"), Some("opencode"));
+        assert_eq!(provider_for_agent("pi_agent"), Some("pi_agent"));
+        // Genuinely unknown agents still return None so resolve_provider
+        // falls back to model-string inference.
+        assert_eq!(provider_for_agent("unknown_agent"), None);
+        assert_eq!(provider_for_agent(""), None);
+    }
+
+    #[test]
+    fn resolve_provider_prefers_agent_over_model() {
+        // Even if the model string would map to a different provider,
+        // the adapter's known provider wins. (Claude Code only ever
+        // talks to Anthropic, so a stray "gpt-4" in the model field
+        // is either a bug or test data — should still attribute to
+        // Anthropic, not OpenAI.)
+        assert_eq!(resolve_provider("claude_code", Some("gpt-4o")), "anthropic");
+        assert_eq!(resolve_provider("codex", Some("claude-3")), "openai");
+    }
+
+    #[test]
+    fn resolve_provider_uses_agent_name_for_multi_provider_agents() {
+        // Multi-provider agents (cursor/windsurf/opencode/pi) attribute
+        // to themselves regardless of downstream model. The downstream
+        // LLM still appears in the `model` column for drill-down.
+        assert_eq!(
+            resolve_provider("cursor", Some("claude-opus-4-7")),
+            "cursor"
+        );
+        assert_eq!(resolve_provider("windsurf", Some("gpt-4o")), "windsurf");
+        assert_eq!(
+            resolve_provider("opencode", Some("gemini-1.5-pro")),
+            "opencode"
+        );
+        assert_eq!(resolve_provider("pi_agent", Some("gpt-5.5")), "pi_agent");
+    }
+
+    #[test]
+    fn resolve_provider_returns_unknown_only_for_genuinely_unknown_agents() {
+        // Truly unknown agent + unmapped model string → "unknown".
+        // Never falls back to the legacy "code" placeholder.
+        assert_eq!(
+            resolve_provider("brand_new_agent", Some("future-model-x")),
+            "unknown"
+        );
+        assert_eq!(resolve_provider("brand_new_agent", None), "unknown");
+        // Never falls back to the legacy "code" placeholder.
+        assert_ne!(resolve_provider("brand_new_agent", None), "code");
+    }
+
+    #[test]
+    fn infer_provider_falls_back_to_unknown_for_unmapped_and_empty() {
+        // Empty model string (rare but possible on extract_model
+        // miss) must not surface as the legacy "code" placeholder.
+        assert_eq!(infer_provider_from_model(""), "unknown");
+        assert_eq!(infer_provider_from_model("   "), "unknown");
+        // Models we don't recognize get bucketed under unknown rather
+        // than guessed — wrong attribution is worse than no attribution
+        // on the engineering models page.
+        assert_eq!(infer_provider_from_model("some-future-model-x"), "unknown");
+    }
+
+    #[test]
+    fn data_source_for_agent_maps_known_adapters() {
+        // Pin the wire form per adapter so the dashboard's
+        // `data_source` filtering stays stable when new adapters land.
+        assert_eq!(data_source_for_agent("claude_code"), "code_claude_code");
+        assert_eq!(data_source_for_agent("cursor"), "code_cursor");
+        assert_eq!(data_source_for_agent("codex"), "code_codex");
+        assert_eq!(data_source_for_agent("gemini_cli"), "code_gemini_cli");
+        assert_eq!(data_source_for_agent("windsurf"), "code_windsurf");
+        assert_eq!(data_source_for_agent("opencode"), "code_open_code");
+        assert_eq!(data_source_for_agent("pi_agent"), "code_pi_agent");
+    }
+
+    #[test]
+    fn data_source_for_agent_falls_back_to_code_unknown_not_claude_code() {
+        // Regression guard: the historical fallback was
+        // `code_claude_code`, which silently mis-attributed every
+        // unrecognized agent's events to Claude Code on the
+        // dashboard. Unknown agents must land in the dedicated
+        // `code_unknown` bucket so operators can audit them.
+        assert_eq!(data_source_for_agent(""), "code_unknown");
+        assert_eq!(data_source_for_agent("mistyped_agent"), "code_unknown");
+        assert_eq!(data_source_for_agent("CursorAdapter"), "code_unknown");
+    }
 
     #[test]
     fn pre_tool_use_synthesizes_label_from_tool_name() {
@@ -1627,7 +1972,12 @@ mod tests {
     }
 
     #[test]
-    fn default_deny_blocks_when_artifacts_present() {
+    fn default_deny_flags_but_does_not_block_on_credentials() {
+        // Code-extension stance: the fallback path is observational.
+        // A credential artifact produces a Flag (visible in `soth code
+        // tail` and the dashboard) but the action proceeds. Blocking
+        // only happens via explicit CEL rules from a loaded policy
+        // bundle (embedded default or operator-installed).
         let arts = vec![SensitiveArtifact {
             kind: soth_core::ArtifactKind::AwsAccessKey,
             credential_kind: Some("aws_access_key".to_string()),
@@ -1637,13 +1987,39 @@ mod tests {
             redacted_hint: None,
         }];
         let (decision, policy) = default_deny_from_artifacts(&arts);
-        assert!(matches!(decision, HookDecision::Block { .. }));
-        assert!(matches!(policy.kind, PolicyDecisionKind::Block { .. }));
+        assert!(matches!(decision, HookDecision::Allow));
+        match policy.kind {
+            PolicyDecisionKind::Flag { ref reason } => {
+                assert!(reason.contains("aws_access_key"), "got: {reason}");
+            }
+            other => panic!("expected Flag, got {other:?}"),
+        }
     }
 
     #[test]
     fn default_deny_allows_when_no_artifacts() {
         let (decision, policy) = default_deny_from_artifacts(&[]);
+        assert!(matches!(decision, HookDecision::Allow));
+        assert!(matches!(policy.kind, PolicyDecisionKind::Allow));
+    }
+
+    #[test]
+    fn default_deny_allows_when_only_code_block_artifacts() {
+        // The original Windows regression: a CodeBlock artifact (emitted
+        // by soth-detect when the payload looks code-shaped) used to
+        // trigger a silent Block via the default-deny path. The fix
+        // requires Allow.
+        let arts = vec![SensitiveArtifact {
+            kind: soth_core::ArtifactKind::CodeBlock {
+                language: "unknown".to_string(),
+            },
+            credential_kind: None,
+            severity: soth_core::ArtifactSeverity::Low,
+            location: soth_core::ArtifactLocation::Unknown,
+            commitment: None,
+            redacted_hint: None,
+        }];
+        let (decision, policy) = default_deny_from_artifacts(&arts);
         assert!(matches!(decision, HookDecision::Allow));
         assert!(matches!(policy.kind, PolicyDecisionKind::Allow));
     }
@@ -1723,7 +2099,11 @@ mod tests {
         assert_eq!(provider_for_agent("claude_code"), Some("anthropic"));
         assert_eq!(provider_for_agent("codex"), Some("openai"));
         assert_eq!(provider_for_agent("gemini_cli"), Some("google"));
-        assert_eq!(provider_for_agent("cursor"), None); // multi-provider
+        // Multi-provider agents attribute to themselves (see
+        // provider_for_agent_attributes_multi_provider_agents_to_themselves
+        // for full coverage).
+        assert_eq!(provider_for_agent("cursor"), Some("cursor"));
+        assert_eq!(provider_for_agent("pi_agent"), Some("pi_agent"));
         assert_eq!(provider_for_agent("unknown_agent"), None);
     }
 
@@ -1989,14 +2369,15 @@ mod tests {
 
     #[test]
     fn capture_audit_persists_only_for_block_decisions() {
-        // Force `policy_bundle()` to return None so this test
-        // exercises the artifact-default-deny path regardless
-        // of whatever bundle the dev host has at
-        // `~/.soth/code-policy.bundle`.  Without this opt-out,
-        // a host with a real bundle that allows the test's
-        // synthesized AKIA pattern would skip the Block path
-        // and the assertion below would fail.
-        std::env::set_var("SOTH_CODE_POLICY_BUNDLE_DISABLE", "1");
+        // Exercises the Audit capture mode's contract: raw_payload is
+        // attached *only* when the policy decision was Block. Uses the
+        // embedded default rule pack's `code_block_destructive_rm_rf`
+        // rule (active by default without any on-disk bundle) to
+        // produce a deterministic Block — credentials alone no longer
+        // block under the code extension's notify-don't-gate stance,
+        // so we trigger the block via an explicit CEL rule match.
+        let _guard = POLICY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("SOTH_CODE_POLICY_BUNDLE_DISABLE");
         let tmp = tempfile::tempdir().unwrap();
         let paths = CodePaths::from_root(tmp.path());
         let cap = HookCaptureConfig {
@@ -2009,20 +2390,11 @@ mod tests {
             br#"{"session_id":"audit","tool_name":"Read","tool_input":{"file_path":"/tmp/x"}}"#;
         run_hook("claude_code", "pre_tool_use", allow_stdin, &paths, &cap).unwrap();
 
-        // Block event — credential synthesized at runtime so the
-        // source file itself is free of the pattern.
-        let synth = format!("{}{}", "AKIA", "IOSFODNN7EXAMPLE");
-        let block_stdin = format!(
-            r#"{{"session_id":"audit","tool_name":"Bash","tool_input":{{"command":"K={synth} aws s3 ls"}}}}"#,
-        );
-        run_hook(
-            "claude_code",
-            "pre_tool_use",
-            block_stdin.as_bytes(),
-            &paths,
-            &cap,
-        )
-        .unwrap();
+        // Block event — `rm -rf` matches the embedded default rule
+        // `code_block_destructive_rm_rf` (block action).
+        let block_stdin =
+            br#"{"session_id":"audit","tool_name":"Bash","tool_input":{"command":"rm -rf /tmp/x"}}"#;
+        run_hook("claude_code", "pre_tool_use", block_stdin, &paths, &cap).unwrap();
 
         let lines: Vec<_> = std::fs::read_to_string(&paths.queue)
             .unwrap()
@@ -2039,7 +2411,7 @@ mod tests {
         let block_meta = &lines[1]["event"]["context"]["metadata"];
         assert!(
             block_meta["raw_payload"].is_string(),
-            "Audit MUST capture on Block"
+            "Audit MUST capture on Block (rm -rf rule)"
         );
         assert_eq!(block_meta["raw_capture"], "audit");
     }
@@ -2088,18 +2460,20 @@ mod tests {
     }
 
     #[test]
-    fn pre_tool_use_with_credentials_still_blocks() {
-        // Regression guard: the enforcement gate must NOT downgrade
-        // Block on enforceable hook types. PreToolUse with a
-        // credential remains a Block.
-        // Force the policy-bundle path to None so this test
-        // exercises the artifact-default-deny code path
-        // regardless of any real bundle on the dev host.
+    fn pre_tool_use_with_credentials_does_not_block_by_default() {
+        // Contract for the code extension's default stance: credential
+        // detection alone never produces a Block. The artifact is
+        // recorded (audit trail) and surfaced as a Flag, but the
+        // agent's action proceeds. Operators who *do* want to block on
+        // credentials install an explicit CEL rule via
+        // `soth code policy apply` — the embedded default pack ships
+        // with notify-only behavior for credentials.
+        let _guard = POLICY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("SOTH_CODE_POLICY_BUNDLE_DISABLE", "1");
         let tmp = tempfile::tempdir().unwrap();
         let paths = CodePaths::from_root(tmp.path());
         let stdin = br#"{
-            "session_id": "sess-block-still",
+            "session_id": "sess-creds-allow",
             "tool_name": "Bash",
             "tool_input": { "command": "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE aws s3 ls" }
         }"#;
@@ -2112,8 +2486,56 @@ mod tests {
         )
         .unwrap();
         assert!(
+            matches!(outcome.decision, HookDecision::Allow),
+            "PreToolUse with AWS key must Allow under default-deny fallback, got {:?}",
+            outcome.decision
+        );
+        // The artifact must still land in the queue — audit trail
+        // matters even when enforcement doesn't.
+        let row: serde_json::Value = serde_json::from_str(
+            std::fs::read_to_string(&paths.queue)
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        let artifacts = row["event"]["artifacts"]
+            .as_array()
+            .expect("artifacts array");
+        assert!(
+            !artifacts.is_empty(),
+            "credential artifact must be recorded even though decision is Allow"
+        );
+    }
+
+    #[test]
+    fn pre_tool_use_blocks_when_embedded_rule_matches() {
+        // Counterpart to the credential test above: the embedded
+        // default rule pack DOES block on explicit destructive
+        // patterns (rm -rf, dd of=/dev/, …). Verifies the
+        // embedded-bundle fallback wires through to enforcement when a
+        // CEL rule matches.
+        let _guard = POLICY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("SOTH_CODE_POLICY_BUNDLE_DISABLE");
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CodePaths::from_root(tmp.path());
+        let stdin = br#"{
+            "session_id": "sess-rmrf-block",
+            "tool_name": "Bash",
+            "tool_input": { "command": "rm -rf /tmp/anything" }
+        }"#;
+        let outcome = run_hook(
+            "claude_code",
+            "pre_tool_use",
+            stdin,
+            &paths,
+            &HookCaptureConfig::default(),
+        )
+        .unwrap();
+        assert!(
             matches!(outcome.decision, HookDecision::Block { .. }),
-            "PreToolUse with AWS key must still Block, got {:?}",
+            "embedded `rm -rf` rule must produce a Block, got {:?}",
             outcome.decision
         );
     }
@@ -2124,6 +2546,7 @@ mod tests {
         // exercise policy_bundle() directly without polluting the
         // OnceLock for other tests, but the path resolution function
         // is testable in isolation.
+        let _guard = POLICY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let key = "SOTH_CODE_POLICY_BUNDLE";
         std::env::set_var(key, "/some/test/path");
         let p = bundle_path().unwrap();

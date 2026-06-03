@@ -3,7 +3,7 @@
 //! Pi Agent uses Anthropic-conventional hook payloads but with a
 //! flatter shape than Claude Code: tool args under `input`
 //! (not `tool_input`), `tool_call_id` instead of `tool_use_id`. Pre-
-//! action hooks block via exit-2 + stderr reason (gryph PR #22). Pi
+//! action hooks block via exit-2 + stderr reason. Pi
 //! Agent ships its hook configuration via a TS plugin file
 //! (`~/.config/piagent/plugins/`); install for that surface is
 //! deferred to a follow-up Phase-3 commit — the parser ships now so
@@ -70,9 +70,9 @@ impl Adapter for PiAgentAdapter {
     }
 
     fn render_decision(&self, decision: &HookDecision) -> AdapterResponse {
-        // Pi Agent contract per gryph PR #22: stderr trimmed reason +
-        // exit 2 on Block. JSON-on-stdout shape isn't supported by
-        // older Pi Agent versions, so we stay with the simple form.
+        // Pi Agent contract: stderr trimmed reason + exit 2 on Block.
+        // JSON-on-stdout shape isn't supported by older Pi Agent
+        // versions, so we stay with the simple form.
         match decision {
             HookDecision::Allow => AdapterResponse::allow(),
             HookDecision::Block { reason, .. } => AdapterResponse {
@@ -89,10 +89,17 @@ impl Adapter for PiAgentAdapter {
     }
 
     fn is_pre_action_hook(&self, hook_type: &str) -> bool {
-        matches!(
-            hook_type,
-            "pre_tool_use" | "user_prompt_submit" | "before_tool_call" | "subagent_start"
-        )
+        // Only the two events the installed plugin actually fires
+        // (`tool_call` → `pre_tool_use`, `user_prompt_submit`). Pi
+        // Agent's plugin API doesn't surface a separate
+        // `before_tool_call` event (the soth-side `tool_call` handler
+        // is already the pre-call gate) and has no subagent concept,
+        // so advertising those as enforceable would be a false
+        // promise. The `classify_input` + `action_type_for` arms
+        // keep handling them for users who configure raw hooks by
+        // hand, but the policy gate won't claim to block what the
+        // plugin never delivers.
+        matches!(hook_type, "pre_tool_use" | "user_prompt_submit")
     }
 
     fn classify_input(&self, event: &CodeEvent) -> Option<HookContentExtract> {
@@ -196,5 +203,15 @@ mod tests {
         assert!(a.is_pre_action_hook("user_prompt_submit"));
         assert!(!a.is_pre_action_hook("post_tool_use"));
         assert!(!a.is_pre_action_hook("session_shutdown"));
+        // Regression guard: these were previously advertised as
+        // enforceable but the Pi Agent plugin never delivers them.
+        assert!(
+            !a.is_pre_action_hook("before_tool_call"),
+            "Pi Agent has no separate before_tool_call surface"
+        );
+        assert!(
+            !a.is_pre_action_hook("subagent_start"),
+            "Pi Agent plugin API has no subagent concept"
+        );
     }
 }

@@ -623,6 +623,12 @@ impl SyncAgent {
             .clone()
             .or_else(|| Some(std::env::consts::OS.to_string()));
         let heartbeat_hostname = host_details.hostname.clone();
+        // Phase 4 cutoff signal: read the consecutive failure count from
+        // the heartbeat-delivered offer file (set by the auto-applier on
+        // each failed apply). Best-effort — heartbeat must not fail if
+        // disk is unavailable.
+        let consecutive_update_failures = read_local_apply_failure_count();
+
         let request = HeartbeatRequest {
             agent_instance_id: self.config.agent_instance_id.clone(),
             proxy_version: self.config.proxy_version.clone(),
@@ -633,6 +639,7 @@ impl SyncAgent {
             host_details: Some(host_details),
             registry,
             telemetry,
+            consecutive_update_failures,
         };
 
         match self.heartbeat_sender.send(&request).await {
@@ -669,6 +676,35 @@ impl SyncAgent {
                                 error
                             );
                         }
+                    }
+                }
+                // Phase 2 hot-update: persist any heartbeat-delivered
+                // offer to ~/.soth/run/update_pending.json. Failures are
+                // best-effort warnings — the daemon must continue
+                // running even if disk is full / readonly.
+                if let Some(offer) = response.update_available.clone() {
+                    let entry = crate::update_pending::PendingUpdate {
+                        received_at: crate::update_pending::now_epoch_secs(),
+                        agent_instance_id: self.config.agent_instance_id.clone(),
+                        current_version: env!("CARGO_PKG_VERSION").to_string(),
+                        offer,
+                        apply_failed: false,
+                        apply_failed_reason: None,
+                    };
+                    match crate::update_pending::write(&entry) {
+                        Ok(path) => {
+                            tracing::info!(
+                                version = %entry.offer.version,
+                                release_seq = entry.offer.release_seq,
+                                urgency = ?entry.offer.urgency,
+                                path = %path.display(),
+                                "heartbeat-delivered update offer persisted"
+                            );
+                        }
+                        Err(error) => warn!(
+                            error = %error,
+                            "failed to persist heartbeat update_available offer"
+                        ),
                     }
                 }
                 Ok(true)
@@ -2047,6 +2083,25 @@ struct HostOsIdentity {
 struct HostHardwareDetails {
     cpu_model: Option<String>,
     memory_total_mb: Option<u64>,
+}
+
+/// Read the apply-failure counter persisted by the Phase 4 auto-applier.
+/// Sources:
+///   - `~/.soth/run/update_pending.json` carries `apply_failed` (bool)
+///     and `apply_failed_reason`. Phase 4 wraps that with a counter
+///     stored alongside in `update_failures.json` so we don't lose the
+///     count when the offer file is rotated.
+///
+/// Returns None when no failure counter exists yet (most devices).
+fn read_local_apply_failure_count() -> Option<u32> {
+    let home = dirs::home_dir()?;
+    let path = home.join(".soth").join("run").join("update_failures.json");
+    let body = std::fs::read(&path).ok()?;
+    let parsed: serde_json::Value = serde_json::from_slice(&body).ok()?;
+    parsed
+        .get("count")
+        .and_then(|v| v.as_u64())
+        .map(|n| n.min(u32::MAX as u64) as u32)
 }
 
 fn collect_heartbeat_host_details() -> HeartbeatHostDetails {

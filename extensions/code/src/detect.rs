@@ -7,10 +7,10 @@
 //! (e.g. `PolicyDecisionKind::Redact`), not the detector's.
 //!
 //! For Group 4, the hook handler defaults to `Block` when *any*
-//! credential artifact is detected (security-tool stance; gryph Issue
-//! #20's lesson about silent fail-open). Group 5 wires this through
-//! the OPA evaluator so per-org policy can override (e.g. flag-only
-//! mode in dev environments).
+//! credential artifact is detected (security-tool stance — never
+//! silent fail-open). Group 5 wires this through the OPA evaluator
+//! so per-org policy can override (e.g. flag-only mode in dev
+//! environments).
 
 use std::sync::OnceLock;
 

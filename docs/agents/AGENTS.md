@@ -68,26 +68,11 @@ Host lists can still be configured under `forward_proxy.hosts`, but runtime inte
   - For gating corpus/debug traffic, force HTTP/1.1 for h2-incompatible hosts to avoid transport false negatives.
   - Fix direction: add host-level `disable_h2` override (or h2->h1 downgrade path) so downstream ALPN does not advertise/commit h2 for those hosts.
 
-## Backlog — Metadata-Only Implementation Gaps
+## Open Work
 
-Gaps identified during plan audit (2026-03-06). Pick up when available.
-
-### Phase 2 — Dedup & Fingerprinting
-- [ ] `conversation_fingerprint.rs` module: `fingerprint_conversation`, `resolve_effective_capture_mode`, `normalize_message_content`, `novel_tail_slice`
-- [ ] `DetectBundleSlice` threshold config fields: `force_metadata_only_above_bytes`, `min_dedup_payload_bytes`, `seen_code_hash_capacity`, `seen_prefix_hash_capacity`
-
-### Phase 3 — Session/Pipeline
-- [ ] `classify_slice()` function in soth-classify
-- [ ] `reaper_loop()` background tokio task for session TTL cleanup
-- [ ] `sqlite.upsert_code_blob()` implementation
-
-### Phase 4 — Schema
-- [ ] Schema version bump confirmation
-
-### Phase 5 — Extensions
-- [ ] Per-extension `SessionManager` (`HashMap<ExtensionType, SessionManager>`) in extension manager
-- [ ] `build_extension_manager()` wired into soth-proxy main.rs
-- [ ] `ExtensionManager` wired into `ProxyHandler` startup
+Active engineering work is tracked in
+[GitHub Issues](https://github.com/soth-ai/soth/issues). When picking up an
+item, file (or claim) the issue first so we don't double-up.
 
 ## Backlog — Dead Telemetry Variables
 

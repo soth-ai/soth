@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -54,6 +55,14 @@ pub struct DetectResult {
     /// Populated by the detect layer for embedding/classify.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_prompt: Option<String>,
+    /// Raw HTTP body bytes from the original request, forwarded for downstream
+    /// processing that needs the unparsed payload (code blob extraction, tamper-
+    /// proof body hashing, replay). Skipped from serialization because the
+    /// downstream consumers within a single process pass it by-reference; we
+    /// never want to ship raw bodies over the wire by default. SDK callers can
+    /// leave this as `None`.
+    #[serde(default, skip)]
+    pub raw_body_bytes: Option<Bytes>,
 }
 
 impl Default for DetectResult {
@@ -77,6 +86,7 @@ impl Default for DetectResult {
             first_blob_event_id: None,
             import_categories: Vec::new(),
             user_prompt: None,
+            raw_body_bytes: None,
         }
     }
 }

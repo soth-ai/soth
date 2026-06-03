@@ -1,0 +1,11 @@
+# Defensive: never commit private signing material from this directory.
+# Private keys live in ~/.soth/keys/release/ on operator machines and
+# in 1Password as the source of truth. See ops/keys/README.md.
+#
+# Note: the root .gitignore blocks `*.pem` globally. We re-allow public
+# keys here so they ship with the binary (baked in via include_bytes!).
+!*.public.pem
+*.private.pem
+*.private.der
+*.private.key
+*.pem.encrypted

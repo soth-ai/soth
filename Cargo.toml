@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/soth-cli",
+    "crates/soth-cli-update-sidecar",
     "crates/soth-core",
     "crates/soth-api-types",
     "crates/soth-bundle",
@@ -39,12 +40,12 @@ default-members = [
 exclude = []
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.75"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/labterminal/soth"
-authors = ["Labterminal"]
+license = "MPL-2.0"
+repository = "https://github.com/soth-ai/soth"
+authors = ["The Soth Authors"]
 
 [workspace.dependencies]
 # Internal crates
@@ -90,11 +91,14 @@ serde_json = "1"
 serde_yaml = "0.9"
 
 # Cryptography
-ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
+ed25519-dalek = { version = "2", features = ["rand_core", "zeroize", "pkcs8", "pem"] }
 sha2 = "0.10"
 rand = "0.8"
 base64 = "0.22"
 zeroize = { version = "1", features = ["derive", "serde"] }
+
+# Versioning
+semver = { version = "1", features = ["serde"] }
 
 # HTTP
 axum = { version = "0.7", features = ["ws"] }

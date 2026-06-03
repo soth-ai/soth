@@ -920,6 +920,7 @@ async fn heartbeat_handler(
             ok: true,
             config_changed: false,
             server_time: Utc::now().to_rfc3339(),
+            update_available: None,
         }),
     )
 }

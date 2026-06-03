@@ -6,13 +6,13 @@ build-backend = "maturin"
 name = "soth"
 description = "SOTH SDK for Python — observability + policy enforcement for LLM API calls."
 readme = "README.md"
-license = { text = "MIT OR Apache-2.0" }
-authors = [{ name = "Labterminal" }]
+license = { text = "MPL-2.0" }
+authors = [{ name = "The Soth Authors" }]
 requires-python = ">=3.10"  # 3.9 reached EOL October 2025
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Mozilla Public License 2.0 (MPL 2.0)",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -31,8 +31,8 @@ mistral = ["mistralai>=1.0"]
 test = ["pytest>=8", "openai>=1.0"]
 
 [project.urls]
-Homepage = "https://github.com/labterminal/soth"
-Repository = "https://github.com/labterminal/soth"
+Homepage = "https://github.com/soth-ai/soth"
+Repository = "https://github.com/soth-ai/soth"
 
 [tool.maturin]
 # `extension-module` is a soth-py crate feature (gates pyo3's

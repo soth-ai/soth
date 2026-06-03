@@ -6,12 +6,12 @@
 //! (no other module in this crate is allowed to call `dirs::config_dir()`
 //! / `dirs::home_dir()` directly).
 //!
-//! Why: gryph's bug report PR #37 found that `gryph doctor` and
-//! `gryph uninstall --purge` resolved the DB path one way, while the
-//! runtime writer used a different resolution under XDG env vars on
-//! macOS/Windows. The result was a doctor that reported "DB present"
-//! while the actual writer was elsewhere, and an uninstall that missed
-//! the real DB. Single-source resolution prevents that class of bug.
+//! Why: in earlier implementations the `doctor` and `uninstall --purge`
+//! commands resolved the DB path one way, while the runtime writer used
+//! a different resolution under XDG env vars on macOS/Windows. The
+//! result was a doctor that reported "DB present" while the actual
+//! writer was elsewhere, and an uninstall that missed the real DB.
+//! Single-source resolution prevents that class of bug.
 
 use std::path::{Path, PathBuf};
 
@@ -29,10 +29,15 @@ pub struct CodePaths {
     /// Directory for embedded JS/TS plugin assets shipped to OpenCode and
     /// Pi Agent (written here by `soth code install`).
     pub plugin_dir: PathBuf,
-    /// Directory for large-payload blob storage (Phase 5 follow-up; see
-    /// `docs/gryph/plan.md` §10.12 / §11). Holds responses larger than
-    /// the configured inline threshold.
+    /// Directory for large-payload blob storage (Phase 5 follow-up).
+    /// Holds responses larger than the configured inline threshold.
     pub blob_dir: PathBuf,
+    /// Per-host install state file recording which agent hooks
+    /// (`claude_code`, `cursor`, …) have been wired by `soth code
+    /// install`. Source of truth for `soth code status`'s
+    /// `installed` field — `code.yaml` is for tuning knobs and may
+    /// legitimately be absent on a host with hooks installed.
+    pub installed_state: PathBuf,
 }
 
 impl CodePaths {
@@ -53,6 +58,7 @@ impl CodePaths {
             config: root.join("code.yaml"),
             plugin_dir: root.join("code").join("plugins"),
             blob_dir: root.join("code").join("blobs"),
+            installed_state: root.join("installed.json"),
         }
     }
 }
@@ -74,6 +80,11 @@ mod tests {
         assert_eq!(p.config, PathBuf::from("/test/.soth/code.yaml"));
         assert_eq!(p.plugin_dir, PathBuf::from("/test/.soth/code/plugins"));
         assert_eq!(p.blob_dir, PathBuf::from("/test/.soth/code/blobs"));
+        assert_eq!(
+            p.installed_state,
+            PathBuf::from("/test/.soth/installed.json"),
+            "installed_state must match InstalledHostState::default_path()"
+        );
     }
 
     #[test]

@@ -11,7 +11,8 @@
 #   help         show this help
 #   build-cli    build all 5 platform binaries with embedded creds → dist/
 #   publish-cli  push dist/ binaries to ENV destination + verify
-#   release-cli  build-cli + publish-cli
+#   release-cli  build-cli + publish-cli + manifest pipeline for both
+#                stable and canary channels (override with CHANNEL=…)
 #   verify-cli   re-run sha verification only (no build, no publish)
 #   diff         local sha vs ENV currently-served sha
 #   clean-dist   rm -rf dist/
@@ -42,7 +43,7 @@ ENV="${2:-staging}"
 : "${AWS_CA_BUNDLE:=/etc/ssl/cert.pem}"
 
 : "${DIST_DIR:=./dist}"
-: "${DATA_DIR:=$HOME/labterminal/soth/data}"
+: "${DATA_DIR:=$HOME/.soth/release-data}"
 
 # Phase 2 / 3 (admin API)
 : "${PLATFORM_ADMIN_TOKEN:=}"
@@ -50,6 +51,20 @@ ENV="${2:-staging}"
 # VERSION default for classify + catalog. Today's prod is `v1-2026-04-28`,
 # matched here so the auto-default lines up with the existing convention.
 : "${VERSION:=v1-$(date +%Y-%m-%d)}"
+
+# Release-manifest signing (Phase 1 hot-update).
+# Privates live outside the repo (1Password / operator vault); operator
+# pulls the active key into SOTH_RELEASE_KEY_DIR before `make release-cli`.
+: "${SOTH_RELEASE_KEY_DIR:=$HOME/.soth/keys/release}"
+# Override to publish a non-default channel for an ENV (e.g. CHANNEL=canary
+# from prod). Default is derived from ENV via default_channel_for_env.
+: "${CHANNEL:=}"
+# Floor for the client-side min_supported_version anti-rollback gate.
+# Bump only when shipping a release that intentionally drops support for
+# older clients (e.g. breaking the heartbeat protocol).
+: "${MIN_SUPPORTED_VERSION:=0.1.0}"
+# Where release notes live. Manifest stores the URL; clients open it.
+: "${RELEASE_NOTES_URL_TEMPLATE:=https://github.com/soth-ai/soth/releases/tag/v%VERSION%}"
 
 PROD_BASE_URL="https://storage.soth.ai/release"
 STAGING_BASE_URL="https://storage.staging.soth.xyz/release"
@@ -71,6 +86,12 @@ CLI_BINARIES=(
   soth-linux-amd64
   soth-linux-arm64
   soth-windows-amd64.exe
+  # Phase 4b sidecar updater. Built by `cmd_build_cli`, published
+  # alongside the main binaries, NOT included in the release manifest's
+  # `platforms` map (it's not a primary install artifact). Operators
+  # download it once into %LOCALAPPDATA%\soth\ and it's reused across
+  # every subsequent main-binary update.
+  soth-update-windows-amd64.exe
 )
 
 # --- Per-env file load ------------------------------------------------------
@@ -116,9 +137,18 @@ cmd_help() {
 	CLI binaries (Phase 1):
 	  build-cli              Build all 5 platform binaries (embedded creds) → ${DIST_DIR}/
 	  publish-cli            Push ${DIST_DIR}/ binaries to ENV destination + verify
-	  release-cli            build-cli + publish-cli
+	  release-cli            build-cli + publish-cli + manifest pipeline.
+	                         Publishes both stable + canary manifests by default;
+	                         set CHANNEL=<stable|canary> to ship one channel only.
 	  verify-cli             Re-verify remote sha matches ${DIST_DIR}/ (no build/publish)
 	  diff                   Local sha vs ENV's currently-served sha
+
+	Hot-update manifest (Phase 1):
+	  generate-manifest      Build ${DIST_DIR}/manifest/<channel>.json from sha sidecars
+	  sign-manifest          ed25519-sign manifest with SOTH_RELEASE_KEY_DIR/<key>.private.pem
+	  publish-manifest       Upload manifest.json + .sig to ENV's storage URL
+	  verify-manifest        Round-trip: re-fetch, re-verify against ops/keys/<key>.public.pem
+	  register-release       POST manifest metadata to ADMIN_API/v1/admin/cli/releases
 
 	Classify bundle (Phase 2):
 	  build-classify         tar -czf ${DIST_DIR}/classify-\$VERSION.tar.gz from \$DATA_DIR/classify/
@@ -148,6 +178,8 @@ cmd_help() {
 	  MINIO_SECRET_KEY        publish-cli ENV=staging
 	  PLATFORM_ADMIN_TOKEN    publish-classify, *-catalog
 	  ADMIN_API               publish-classify, *-catalog (auto-defaults per ENV)
+	  SOTH_RELEASE_KEY_DIR    sign-manifest (default ~/.soth/keys/release)
+	  CHANNEL                 override channel for ENV (staging→staging, prod→stable)
 	  (prod CLI publish uses \`npx -y wrangler@4.75.0 login\` — no extra creds.)
 
 	Phase 4 (status/diff cross-env) and Phase 5 (GHA wrappers) follow.
@@ -200,6 +232,16 @@ cmd_build_cli() {
   build_one soth-linux-arm64        aarch64-unknown-linux-gnu.2.17        zigbuild  soth  aarch64-unknown-linux-gnu
   build_one soth-windows-amd64.exe  x86_64-pc-windows-gnu                 cargo     soth.exe
 
+  # Phase 4b Windows sidecar updater. Tiny self-contained binary that
+  # ships alongside soth.exe and owns the lock-release-and-replace
+  # sequence (Windows holds an exclusive lock on the running .exe).
+  echo
+  echo "==> soth-update-windows-amd64.exe  (sidecar updater)"
+  rustup target add x86_64-pc-windows-gnu >/dev/null
+  cargo build -p soth-cli-update-sidecar --bin soth-update --release --target x86_64-pc-windows-gnu
+  cp target/x86_64-pc-windows-gnu/release/soth-update.exe \
+     "${DIST_DIR}/soth-update-windows-amd64.exe"
+
   echo
   echo "==> sha256 manifests"
   (
@@ -248,15 +290,26 @@ cmd_publish_cli_staging() {
   export AWS_SECRET_ACCESS_KEY="$MINIO_SECRET_KEY"
   export AWS_CA_BUNDLE
 
+  # Per-version layout. All binaries land at
+  #   ${MINIO_BUCKET}/v<VERSION>/<filename>
+  # No unversioned latest-pointer copy — the signed channel manifest
+  # is the only routing layer. Customers consuming
+  # `${BASE_URL}/soth-darwin-arm64` directly (without the manifest)
+  # broke on the 0.1.0 GA cut; that path was never the supported one.
+  local version
+  version=$(extract_workspace_version)
+  [ -n "$version" ] || err "could not extract workspace version from Cargo.toml"
+  local version_prefix="v${version}/"
+
   for f in "${CLI_BINARIES[@]}" "${CLI_BINARIES[@]/%/.sha256}"; do
-    echo "==> S3 put s3://${MINIO_BUCKET}/${f}"
-    aws s3 cp "${DIST_DIR}/${f}" "s3://${MINIO_BUCKET}/${f}" \
+    echo "==> S3 put s3://${MINIO_BUCKET}/${version_prefix}${f}"
+    aws s3 cp "${DIST_DIR}/${f}" "s3://${MINIO_BUCKET}/${version_prefix}${f}" \
       --endpoint-url "$MINIO_ENDPOINT_URL" \
-      --cache-control "no-store, max-age=0" \
+      --cache-control "public, max-age=31536000, immutable" \
       --no-progress
   done
 
-  cmd_verify_against "$STAGING_BASE_URL"
+  cmd_verify_against "$STAGING_BASE_URL" "$version_prefix"
 }
 
 cmd_publish_cli_prod() {
@@ -278,37 +331,490 @@ cmd_publish_cli_prod() {
 
   unset HTTPS_PROXY HTTP_PROXY https_proxy http_proxy
 
+  local version
+  version=$(extract_workspace_version)
+  [ -n "$version" ] || err "could not extract workspace version from Cargo.toml"
+  local version_prefix="v${version}/"
+
   for f in "${CLI_BINARIES[@]}" "${CLI_BINARIES[@]/%/.sha256}"; do
-    echo "==> R2 put ${R2_BUCKET}/${R2_PREFIX}${f}"
-    $WRANGLER r2 object put "${R2_BUCKET}/${R2_PREFIX}${f}" \
+    echo "==> R2 put ${R2_BUCKET}/${R2_PREFIX}${version_prefix}${f}"
+    # Per-version paths are immutable — bytes at v0.1.0/soth-darwin-arm64
+    # never change after the first publish. Cache for a year so the CDN
+    # absorbs traffic.
+    $WRANGLER r2 object put "${R2_BUCKET}/${R2_PREFIX}${version_prefix}${f}" \
       --file="${DIST_DIR}/${f}" \
       --remote \
-      --cache-control "no-store, max-age=0"
+      --cache-control "public, max-age=31536000, immutable"
   done
 
-  cmd_verify_against "$PROD_BASE_URL"
+  cmd_verify_against "$PROD_BASE_URL" "$version_prefix"
+}
+
+# --- release manifest (Phase 1 hot-update) ----------------------------------
+#
+# After publish-cli has uploaded the per-platform binaries + .sha256
+# sidecars, generate-manifest assembles a signed manifest that clients
+# fetch via `soth update --check`. The manifest is the source of truth
+# for "what's the latest version on channel X?" — clients only trust
+# what's signed.
+#
+# Schema is documented in docs/common/2026-05-09/hot-update-plan.md §2.1.
+# Signature is raw ed25519 (64 bytes) over the manifest.json bytes.
+# OpenSSL 3.0+ is required (-rawin support).
+
+default_channel_for_env() {
+  case "$1" in
+    # Channel and environment are orthogonal axes:
+    #   environment = base URL (where).
+    #   channel     = trust tier (stable for everyone, canary for
+    #                 risk-tolerant). soth-team tests by pointing
+    #                 the base URL at staging while staying on
+    #                 canary (or stable, for release-candidate
+    #                 dress rehearsals).
+    staging) echo "canary" ;;
+    prod)    echo "stable" ;;
+    local)   echo "canary" ;;
+    *)       echo "" ;;
+  esac
+}
+
+# Map channel → which keypair signs it.
+key_basename_for_channel() {
+  case "$1" in
+    stable) echo "stable" ;;
+    canary) echo "canary" ;;
+    *) err "unknown channel '$1' (expected stable|canary)" ;;
+  esac
+}
+
+base_url_for_env() {
+  case "$1" in
+    staging) echo "$STAGING_BASE_URL" ;;
+    prod)    echo "$PROD_BASE_URL" ;;
+    local)   echo "" ;;
+    *)       echo "" ;;
+  esac
+}
+
+# Map a publish-cli filename to the manifest's platform key.
+# soth-darwin-arm64           → darwin-arm64
+# soth-windows-amd64.exe      → windows-amd64
+binary_to_platform_key() {
+  local f="$1"
+  f="${f#soth-}"
+  f="${f%.exe}"
+  echo "$f"
+}
+
+extract_workspace_version() {
+  awk '
+    /^\[workspace\.package\]/ { in_wp=1; next }
+    /^\[/                     { in_wp=0 }
+    in_wp && /^version[[:space:]]*=/ {
+      gsub(/[\"[:space:]]/, "", $0)
+      sub(/^version=/, "")
+      print
+      exit
+    }
+  ' Cargo.toml
+}
+
+# Pull the current channel manifest's release_seq so we can monotonically
+# increment. Returns 0 if no manifest exists yet (first publish to channel).
+fetch_current_release_seq() {
+  local base="$1" channel="$2"
+  local url="${base}/manifest/${channel}.json?cb=$(date +%s)"
+  local body
+  body=$(curl -sfL "$url" 2>/dev/null || true)
+  if [ -z "$body" ]; then
+    echo 0
+    return
+  fi
+  echo "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("release_seq", 0))' 2>/dev/null || echo 0
+}
+
+# Resolve the channel: explicit $CHANNEL wins, else env-derived default.
+resolve_channel() {
+  if [ -n "$CHANNEL" ]; then
+    echo "$CHANNEL"
+  else
+    default_channel_for_env "$ENV"
+  fi
+}
+
+# Which channels `release-cli` should publish a manifest for.
+#
+# When the operator explicitly sets $CHANNEL (e.g. `CHANNEL=canary make
+# release-cli`) we honor it — that's the "ship a single channel" path.
+# Otherwise we publish BOTH stable and canary in one pass. The
+# motivation: every staging environment defaults its install script
+# to canary (matching the trust tier for risk-tolerant clients), but
+# operators tend to think "I bumped stable, I'm done" — leaving the
+# canary manifest stale or absent. The install script then 404s on
+# the canary URL even though stable is fine. Symmetric publish
+# prevents that whole class of asymmetry footgun.
+#
+# Local env skips manifest publish entirely (handled by cmd_release_cli).
+channels_to_publish() {
+  if [ -n "$CHANNEL" ]; then
+    echo "$CHANNEL"
+  else
+    echo "stable canary"
+  fi
+}
+
+cmd_generate_manifest() {
+  ensure_dist_present
+  require_cmd python3
+  require_cmd shasum
+  require_cmd curl
+
+  local channel
+  channel=$(resolve_channel)
+  [ -n "$channel" ] || err "could not resolve channel for ENV=$ENV (set CHANNEL explicitly)"
+
+  local base
+  base=$(base_url_for_env "$ENV")
+  [ -n "$base" ] || err "no base URL for ENV=$ENV (only staging|prod produce remote manifests)"
+
+  local version
+  version=$(extract_workspace_version)
+  [ -n "$version" ] || err "could not extract workspace version from Cargo.toml"
+
+  local current_seq next_seq
+  current_seq=$(fetch_current_release_seq "$base" "$channel")
+  next_seq=$((current_seq + 1))
+
+  local released_at
+  released_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+  local notes_url="${RELEASE_NOTES_URL_TEMPLATE/\%VERSION\%/$version}"
+
+  mkdir -p "${DIST_DIR}/manifest"
+  local out="${DIST_DIR}/manifest/${channel}.json"
+
+  echo "==> generate manifest (channel=${channel}, version=${version}, release_seq=${next_seq})"
+
+  # Build platforms map by walking CLI_BINARIES + their .sha256 sidecars.
+  # The sidecar updater (soth-update-windows-amd64.exe) is published
+  # but kept OUT of the manifest — it's not a primary install artifact;
+  # the client looks for it locally on Windows and never via the
+  # manifest's `platforms` map.
+  #
+  # Per-version URL pattern: <base>/v<VERSION>/<filename>. Frozen,
+  # immutable, cacheable forever. Old manifests on client disk
+  # continue to point at real bytes even after newer versions ship.
+  local platforms_json="{"
+  local first=1
+  for f in "${CLI_BINARIES[@]}"; do
+    case "$f" in
+      soth-update-*) continue ;;
+    esac
+    local key sha
+    key=$(binary_to_platform_key "$f")
+    sha=$(awk '{print $1}' "${DIST_DIR}/${f}.sha256")
+    [ -n "$sha" ] || err "empty sha256 for ${f}"
+    if [ "$first" = 1 ]; then first=0; else platforms_json+=", "; fi
+    platforms_json+="\"${key}\": {\"url\": \"${base}/v${version}/${f}\", \"sha256\": \"${sha}\"}"
+  done
+  platforms_json+="}"
+
+  # python3 emits the canonical JSON (sorted keys, no trailing whitespace)
+  # so the signing input is byte-stable across operator machines.
+  python3 - "$out" <<-PYEOF
+	import json, os, sys
+	out = sys.argv[1]
+	manifest = {
+	    "schema_version": 1,
+	    "channel": "${channel}",
+	    "version": "${version}",
+	    "release_seq": ${next_seq},
+	    "released_at": "${released_at}",
+	    "min_supported_version": "${MIN_SUPPORTED_VERSION}",
+	    "release_notes_url": "${notes_url}",
+	    "platforms": ${platforms_json},
+	}
+	with open(out, "w") as fh:
+	    json.dump(manifest, fh, sort_keys=True, separators=(",", ":"))
+	    fh.write("\n")
+	size = os.path.getsize(out)
+	print(f"  wrote {out} ({size} bytes, {len(manifest['platforms'])} platforms)")
+PYEOF
+}
+
+cmd_sign_manifest() {
+  require_cmd openssl
+  local channel key_basename key_path manifest sig pubkey
+  channel=$(resolve_channel)
+  [ -n "$channel" ] || err "could not resolve channel for ENV=$ENV"
+  key_basename=$(key_basename_for_channel "$channel")
+
+  key_path="${SOTH_RELEASE_KEY_DIR}/${key_basename}.private.pem"
+  manifest="${DIST_DIR}/manifest/${channel}.json"
+  sig="${manifest}.sig"
+  pubkey="ops/keys/${key_basename}.public.pem"
+
+  [ -f "$key_path" ] || err "private key missing: $key_path (pull from 1Password)"
+  [ -f "$manifest" ] || err "manifest missing: $manifest (run generate-manifest first)"
+  [ -f "$pubkey" ] || err "public key missing: $pubkey"
+
+  echo "==> sign manifest (channel=${channel}, key=${key_basename})"
+  openssl pkeyutl -sign -inkey "$key_path" -rawin -in "$manifest" -out "$sig"
+
+  # Self-verify before publishing — guarantees the signature roundtrips
+  # against the public key that ships in the binary.
+  openssl pkeyutl -verify -pubin -inkey "$pubkey" -rawin \
+    -in "$manifest" -sigfile "$sig" >/dev/null \
+    || err "self-verify failed; aborting publish"
+
+  printf "  manifest:  %s\n" "$manifest"
+  printf "  signature: %s (%s bytes)\n" "$sig" "$(wc -c < "$sig" | tr -d ' ')"
+  printf "  pubkey:    %s\n" "$pubkey"
+}
+
+cmd_publish_manifest() {
+  local channel manifest sig version
+  channel=$(resolve_channel)
+  manifest="${DIST_DIR}/manifest/${channel}.json"
+  sig="${manifest}.sig"
+  version=$(extract_workspace_version)
+  [ -n "$version" ] || err "could not extract workspace version from Cargo.toml"
+
+  [ -f "$manifest" ] || err "manifest missing: $manifest"
+  [ -f "$sig" ]      || err "signature missing: $sig"
+
+  # Two publish targets per channel manifest:
+  #   1. manifest/<channel>.json{,.sig}              ← channel-current pointer.
+  #      Overwritten every release. no-store cache so a stale CDN doesn't
+  #      hide a fresh release. The "what's latest on stable" route.
+  #   2. manifest/<channel>.v<VERSION>.json{,.sig}   ← frozen per-version
+  #      snapshot. Never overwritten. Long-cached. Lets `soth update
+  #      --version 0.1.0` and rollback paths fetch a manifest that matches
+  #      the per-version binary URLs forever.
+  local versioned_manifest_name="${channel}.v${version}.json"
+
+  case "$ENV" in
+    local)
+      echo "==> ENV=local: manifest stays in ${manifest}, no remote publish."
+      ;;
+    staging)
+      require_var MINIO_ACCESS_KEY
+      require_var MINIO_SECRET_KEY
+      require_cmd aws
+      export AWS_ACCESS_KEY_ID="$MINIO_ACCESS_KEY"
+      export AWS_SECRET_ACCESS_KEY="$MINIO_SECRET_KEY"
+      export AWS_CA_BUNDLE
+
+      # Channel-current (mutable, no-cache).
+      for f in "${channel}.json" "${channel}.json.sig"; do
+        echo "==> S3 put s3://${MINIO_BUCKET}/manifest/${f}"
+        aws s3 cp "${DIST_DIR}/manifest/${f}" "s3://${MINIO_BUCKET}/manifest/${f}" \
+          --endpoint-url "$MINIO_ENDPOINT_URL" \
+          --cache-control "no-store, max-age=0" \
+          --no-progress
+      done
+
+      # Frozen per-version snapshot (immutable, year-cached).
+      for f in "${manifest}" "${sig}"; do
+        local frozen_name
+        frozen_name=$(basename "$f" | sed "s/^${channel}/${channel}.v${version}/")
+        echo "==> S3 put s3://${MINIO_BUCKET}/manifest/${frozen_name}"
+        aws s3 cp "$f" "s3://${MINIO_BUCKET}/manifest/${frozen_name}" \
+          --endpoint-url "$MINIO_ENDPOINT_URL" \
+          --cache-control "public, max-age=31536000, immutable" \
+          --no-progress
+      done
+      ;;
+    prod)
+      require_cmd npx
+      local WRANGLER="npx -y wrangler@4.75.0"
+      $WRANGLER whoami >/dev/null 2>&1 \
+        || err "wrangler not logged in (run \`npx -y wrangler@4.75.0 login\`)"
+      unset HTTPS_PROXY HTTP_PROXY https_proxy http_proxy
+
+      # Channel-current (mutable, no-cache).
+      for f in "${channel}.json" "${channel}.json.sig"; do
+        echo "==> R2 put ${R2_BUCKET}/${R2_PREFIX}manifest/${f}"
+        $WRANGLER r2 object put "${R2_BUCKET}/${R2_PREFIX}manifest/${f}" \
+          --file="${DIST_DIR}/manifest/${f}" \
+          --remote \
+          --cache-control "no-store, max-age=0"
+      done
+
+      # Frozen per-version snapshot (immutable, year-cached).
+      for f in "${manifest}" "${sig}"; do
+        local frozen_name
+        frozen_name=$(basename "$f" | sed "s/^${channel}/${channel}.v${version}/")
+        echo "==> R2 put ${R2_BUCKET}/${R2_PREFIX}manifest/${frozen_name}"
+        $WRANGLER r2 object put "${R2_BUCKET}/${R2_PREFIX}manifest/${frozen_name}" \
+          --file="$f" \
+          --remote \
+          --cache-control "public, max-age=31536000, immutable"
+      done
+      ;;
+    *) err "ENV must be local|staging|prod (got '$ENV')" ;;
+  esac
+
+  printf "  frozen snapshot: manifest/%s\n" "$versioned_manifest_name"
+}
+
+# Register the just-published release with soth-cloud's admin API
+# (Phase 3a). The hot-update resolver reads `cli_releases` on every
+# heartbeat; without this row, a channel pointing at this version will
+# never emit an offer.
+#
+# Idempotent: re-posting the same (version, platform) overwrites url +
+# sha256. Soft-fail (warn) — the manifest is the trust root, so a
+# registration failure means "fleet won't auto-discover this version
+# yet" not "this release is broken".
+#
+# Requires PLATFORM_ADMIN_TOKEN + ADMIN_API. Skipped for ENV=local.
+cmd_register_release() {
+  case "$ENV" in
+    local)
+      echo "==> ENV=local: skipping release registration."
+      return 0
+      ;;
+    staging | prod) ;;
+    *) err "ENV must be local|staging|prod (got '$ENV')" ;;
+  esac
+
+  if [ -z "$PLATFORM_ADMIN_TOKEN" ] || [ -z "$ADMIN_API" ]; then
+    echo "==> WARN: PLATFORM_ADMIN_TOKEN or ADMIN_API empty; skipping release registration."
+    echo "         The release is published but won't be served by the heartbeat resolver"
+    echo "         until you POST it to ${ADMIN_API:-<unset>}/v1/admin/cli/releases."
+    return 0
+  fi
+
+  require_cmd python3
+  require_cmd curl
+
+  local channel manifest
+  channel=$(resolve_channel)
+  manifest="${DIST_DIR}/manifest/${channel}.json"
+  [ -f "$manifest" ] || err "manifest missing: $manifest (run generate-manifest first)"
+
+  echo "==> register release ${ADMIN_API}/v1/admin/cli/releases"
+
+  # The admin API's request body is a strict subset of the manifest
+  # (no channel, schema_version, min_supported_version, released_at).
+  # python3 transforms the existing manifest into the registration
+  # payload to avoid drift between the two shapes.
+  local body
+  body=$(python3 - "$manifest" <<-'PYEOF'
+	import json, sys
+	with open(sys.argv[1]) as fh:
+	    m = json.load(fh)
+	out = {
+	    "version": m["version"],
+	    "release_seq": m["release_seq"],
+	    "platforms": m["platforms"],
+	}
+	if m.get("release_notes_url"):
+	    out["release_notes_url"] = m["release_notes_url"]
+	print(json.dumps(out, separators=(",", ":")))
+PYEOF
+  )
+
+  local http_code
+  http_code=$(curl -sS -o /tmp/soth-release-register-resp.json -w "%{http_code}" \
+    -X POST "${ADMIN_API}/v1/admin/cli/releases" \
+    -H "Authorization: Bearer ${PLATFORM_ADMIN_TOKEN}" \
+    -H "Content-Type: application/json" \
+    --data-raw "$body" 2>&1) || true
+
+  if [ "$http_code" = "200" ] || [ "$http_code" = "201" ]; then
+    printf "  HTTP %s\n" "$http_code"
+    python3 - <<-'PYEOF'
+	import json
+	with open("/tmp/soth-release-register-resp.json") as fh:
+	    r = json.load(fh)
+	print(f"  registered version={r['version']} release_seq={r['release_seq']} platforms={len(r['platforms'])}")
+PYEOF
+  else
+    echo "  WARN: release registration returned HTTP ${http_code}; body:"
+    sed 's/^/    /' /tmp/soth-release-register-resp.json 2>/dev/null || true
+    echo "  Manifest is published; resolver won't serve this version until /admin/cli/releases is populated."
+  fi
+}
+
+# Round-trip verify: download the freshly-published manifest, verify the
+# sig with the committed public key, ensure version + sha entries match
+# what we just uploaded. Belt-and-braces — same idea as cmd_verify_against
+# for binaries.
+cmd_verify_manifest() {
+  require_cmd curl
+  require_cmd openssl
+
+  local channel base manifest_url sig_url tmpdir
+  channel=$(resolve_channel)
+  base=$(base_url_for_env "$ENV")
+  [ -n "$base" ] || err "ENV=$ENV has no remote (use staging|prod)"
+
+  manifest_url="${base}/manifest/${channel}.json?cb=$(date +%s)"
+  sig_url="${base}/manifest/${channel}.json.sig?cb=$(date +%s)"
+
+  tmpdir=$(mktemp -d)
+  # No RETURN trap — that leaks across subsequent functions in the
+  # composite release-cli flow (cmd_register_release after this one)
+  # and fires with `tmpdir` already out of local scope, surfacing as
+  # `tmpdir: unbound variable` under set -u. Clean up inline instead.
+
+  echo "==> fetch ${manifest_url}"
+  curl -sfL "$manifest_url" -o "$tmpdir/manifest.json" \
+    || { rm -rf "$tmpdir"; err "manifest fetch failed"; }
+  curl -sfL "$sig_url" -o "$tmpdir/manifest.json.sig" \
+    || { rm -rf "$tmpdir"; err "signature fetch failed"; }
+
+  local key_basename pubkey
+  key_basename=$(key_basename_for_channel "$channel")
+  pubkey="ops/keys/${key_basename}.public.pem"
+  [ -f "$pubkey" ] || { rm -rf "$tmpdir"; err "public key missing: $pubkey"; }
+
+  openssl pkeyutl -verify -pubin -inkey "$pubkey" -rawin \
+    -in "$tmpdir/manifest.json" -sigfile "$tmpdir/manifest.json.sig" >/dev/null \
+    || { rm -rf "$tmpdir"; err "remote signature verification FAILED"; }
+
+  printf "  channel:   %s\n" "$channel"
+  printf "  signature: OK (verified with %s)\n" "$pubkey"
+  python3 - "$tmpdir/manifest.json" <<-'PYEOF'
+	import json, sys
+	with open(sys.argv[1]) as fh: m = json.load(fh)
+	print(f"  version:   {m['version']}")
+	print(f"  release_seq: {m['release_seq']}")
+	print(f"  released_at: {m['released_at']}")
+	print(f"  platforms: {len(m['platforms'])} entries")
+PYEOF
+  rm -rf "$tmpdir"
 }
 
 # --- verify-cli -------------------------------------------------------------
 
 cmd_verify_cli() {
+  local version_prefix
+  version_prefix="v$(extract_workspace_version)/"
   case "$ENV" in
-    staging) cmd_verify_against "$STAGING_BASE_URL" ;;
-    prod) cmd_verify_against "$PROD_BASE_URL" ;;
+    staging) cmd_verify_against "$STAGING_BASE_URL" "$version_prefix" ;;
+    prod) cmd_verify_against "$PROD_BASE_URL" "$version_prefix" ;;
     *) err "verify-cli only supported for ENV=staging|prod" ;;
   esac
 }
 
-# Walk the binaries, compare local sha to remote sha (cache-busted).
+# Walk the binaries, compare local sha to remote sha. Per-version paths
+# are immutable + year-cached, so the cb= cache-buster is dropped.
+# If the upload just happened, the CDN may briefly serve a 404 on the
+# new path; curl's -f flag would error out which is the right behavior.
 cmd_verify_against() {
   local base="$1"
+  local version_prefix="${2:-}"
   echo
-  echo "=== verifying ${ENV} (${base}) against ${DIST_DIR}/ ==="
+  echo "=== verifying ${ENV} (${base}${version_prefix:+/${version_prefix%/}}) against ${DIST_DIR}/ ==="
   local fail=0
   for f in "${CLI_BINARIES[@]}"; do
-    local local_sha remote_sha
+    local local_sha remote_sha url
+    url="${base}/${version_prefix}${f}"
     local_sha=$(shasum -a 256 "${DIST_DIR}/${f}" | awk '{print $1}')
-    remote_sha=$(curl -sL "${base}/${f}?cb=$(date +%s)" | shasum -a 256 | awk '{print $1}')
+    remote_sha=$(curl -sfL "$url" | shasum -a 256 | awk '{print $1}')
     if [ "$local_sha" = "$remote_sha" ]; then
       printf "  %-30s OK    %s\n" "$f" "$local_sha"
     else
@@ -335,13 +841,16 @@ cmd_diff() {
     prod)    base="$PROD_BASE_URL" ;;
     *) err "diff requires ENV=staging|prod" ;;
   esac
-  echo "=== local ${DIST_DIR}/ vs ${ENV} (${base}) ==="
+  local version version_prefix
+  version=$(extract_workspace_version)
+  version_prefix="v${version}/"
+  echo "=== local ${DIST_DIR}/ vs ${ENV} (${base}/${version_prefix%/}) ==="
   echo
   echo "CLI binaries:"
   for f in "${CLI_BINARIES[@]}"; do
     local local_sha remote_sha status
     local_sha=$(shasum -a 256 "${DIST_DIR}/${f}" 2>/dev/null | awk '{print $1}' || echo "missing")
-    remote_sha=$(curl -sL "${base}/${f}?cb=$(date +%s)" 2>/dev/null | shasum -a 256 | awk '{print $1}' || echo "unreachable")
+    remote_sha=$(curl -sL "${base}/${version_prefix}${f}" 2>/dev/null | shasum -a 256 | awk '{print $1}' || echo "unreachable")
     if [ "$local_sha" = "$remote_sha" ]; then status="OK"; else status="DIFF"; fi
     printf "  %-30s local=%-12s remote=%-12s %s\n" \
       "$f" "${local_sha:0:12}" "${remote_sha:0:12}" "$status"
@@ -397,20 +906,35 @@ cmd_status_local() {
 }
 
 cmd_status_remote() {
-  local base
+  local base channel
   case "$ENV" in
     staging) base="$STAGING_BASE_URL" ;;
     prod)    base="$PROD_BASE_URL" ;;
   esac
+  channel=$(resolve_channel)
   echo "=== ${ENV} status ==="
 
-  echo
-  echo "CLI binaries (${base}):"
-  for f in "${CLI_BINARIES[@]}"; do
-    local sha
-    sha=$(curl -sL "${base}/${f}?cb=$(date +%s)" 2>/dev/null | shasum -a 256 | awk '{print $1}' || echo "unreachable")
-    printf "  %-30s %s\n" "$f" "${sha:0:12}"
-  done
+  # Resolve the per-version path from the published channel manifest
+  # rather than walking unversioned URLs (those don't exist after
+  # 0.1.0). The manifest is the routing layer; we follow it.
+  local manifest_url remote_version
+  manifest_url="${base}/manifest/${channel}.json?cb=$(date +%s)"
+  remote_version=$(curl -sfL "$manifest_url" 2>/dev/null \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])' 2>/dev/null \
+    || echo "")
+  if [ -z "$remote_version" ]; then
+    echo
+    echo "CLI binaries: no channel manifest at ${manifest_url}"
+  else
+    local version_prefix="v${remote_version}/"
+    echo
+    echo "CLI binaries (${base}/${version_prefix%/}, channel=${channel}, version=${remote_version}):"
+    for f in "${CLI_BINARIES[@]}"; do
+      local sha
+      sha=$(curl -sL "${base}/${version_prefix}${f}" 2>/dev/null | shasum -a 256 | awk '{print $1}' || echo "unreachable")
+      printf "  %-30s %s\n" "$f" "${sha:0:12}"
+    done
+  fi
 
   echo
   echo "Classify bundle (last published from this machine):"
@@ -475,6 +999,32 @@ cmd_status_all() {
 cmd_release_cli() {
   cmd_build_cli
   cmd_publish_cli
+  # Hot-update manifest pipeline. Skipped for ENV=local — local releases
+  # don't need a signed manifest, and the private key may not be present.
+  #
+  # Loops over `channels_to_publish` so a default `make release-cli
+  # ENV=staging` ships both stable and canary manifests in one pass.
+  # Save/restore $CHANNEL so the loop's overrides don't leak out
+  # (matters when this function is sourced from a longer script that
+  # set $CHANNEL itself before invoking us).
+  if [ "$ENV" != "local" ]; then
+    local saved_channel="$CHANNEL"
+    for channel in $(channels_to_publish); do
+      CHANNEL="$channel"
+      echo
+      echo "###############################################################"
+      echo "###  release-cli: channel = $channel"
+      echo "###############################################################"
+      cmd_generate_manifest
+      cmd_sign_manifest
+      cmd_publish_manifest
+      cmd_verify_manifest
+      # Phase 3a: register the artifact metadata with soth-cloud's
+      # admin API so the heartbeat resolver can serve it. Soft-fail.
+      cmd_register_release
+    done
+    CHANNEL="$saved_channel"
+  fi
 }
 
 # --- classify bundle: build + publish + verify ------------------------------
@@ -663,9 +1213,13 @@ require_catalog_admin_creds() {
   fi
 }
 
-# Hetzner staging deploy — ssh target + on-disk path.
-STAGING_SSH_HOST="ubuntu@65.108.45.248"
-STAGING_RAW_BUNDLE_PATH="/opt/soth/soth-cloud/data/runtime/local-bundle/registry/raw_bundle.json"
+# Staging deploy — ssh target + on-disk path.
+# Set STAGING_SSH_HOST (e.g. user@host) and STAGING_RAW_BUNDLE_PATH in your
+# environment or ops/.env.staging — both are required for `import-catalog
+# staging` and `compile-catalog`. We deliberately do not bake the staging
+# hostname into the script so this file can ship in the public repo.
+STAGING_SSH_HOST="${STAGING_SSH_HOST:-}"
+STAGING_RAW_BUNDLE_PATH="${STAGING_RAW_BUNDLE_PATH:-/opt/soth/soth-cloud/data/runtime/local-bundle/registry/raw_bundle.json}"
 
 cmd_import_catalog() {
   case "$ENV" in
@@ -678,6 +1232,7 @@ cmd_import_catalog() {
 
 cmd_import_catalog_staging() {
   require_catalog_admin_creds
+  require_var STAGING_SSH_HOST "set it in ops/.env.staging (e.g. STAGING_SSH_HOST=user@host)"
 
   local src="${DATA_DIR}/raw_bundle.json"
   [ -f "$src" ] || err "missing $src"
@@ -842,6 +1397,11 @@ case "$VERB" in
   publish-cli)       cmd_publish_cli ;;
   release-cli)       cmd_release_cli ;;
   verify-cli)        cmd_verify_cli ;;
+  generate-manifest) cmd_generate_manifest ;;
+  sign-manifest)     cmd_sign_manifest ;;
+  publish-manifest)  cmd_publish_manifest ;;
+  verify-manifest)   cmd_verify_manifest ;;
+  register-release)  cmd_register_release ;;
   build-classify)    cmd_build_classify ;;
   publish-classify)  cmd_publish_classify ;;
   release-classify)  cmd_release_classify ;;

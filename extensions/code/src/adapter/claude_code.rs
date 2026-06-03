@@ -6,14 +6,14 @@
 //! hook payload is one JSON object piped to stdin; the hook process
 //! returns its decision via stdout JSON or exit code.
 //!
-//! Lessons baked in (from gryph forensics):
-//! - PR #32: tool_response can be array / string / null despite docs;
+//! Lessons baked in from earlier forensics:
+//! - `tool_response` can be array / string / null despite docs;
 //!   parse as `serde_json::Value` and never assume a shape at the
 //!   adapter boundary.
-//! - PR #38: subagent attribution detected by *presence* of
-//!   `agent_id` / `agent_type`; hook event names alone do not
-//!   distinguish main vs subagent.
-//! - PR #35: Block decisions need guidance text routed via the JSON
+//! - Subagent attribution detected by *presence* of `agent_id` /
+//!   `agent_type`; hook event names alone do not distinguish main
+//!   vs subagent.
+//! - Block decisions need guidance text routed via the JSON
 //!   output, not just exit code 2.
 //! - PR #21/#22: line-count helpers must special-case empty sides —
 //!   handled in `crate::diff`.
@@ -62,9 +62,9 @@ impl Adapter for ClaudeCodeAdapter {
         let session_id = extract_session_id(&payload);
         let mut event = CodeEvent::new(NAME, hook_type, action_type, session_id, payload.clone());
 
-        // Subagent attribution — gryph PR #38. Detected only by
-        // *presence* of `agent_id`/`agent_type`, since main and subagent
-        // calls reuse the same hook event names.
+        // Subagent attribution detected only by *presence* of
+        // `agent_id`/`agent_type`, since main and subagent calls
+        // reuse the same hook event names.
         if let Some(sub) = extract_subagent(&payload) {
             event.subagent = Some(sub);
         }
@@ -126,8 +126,8 @@ impl Adapter for ClaudeCodeAdapter {
                 // surfaced to the model. The CLI also accepts exit
                 // code 2 with a stderr message for older flows; we
                 // emit both so all Claude Code versions in the wild
-                // see *something* (gryph PR #35 found Anthropic
-                // changed the documented shape mid-2025).
+                // see *something* (Anthropic changed the documented
+                // shape mid-2025).
                 let mut stdout_obj = serde_json::Map::new();
                 stdout_obj.insert("decision".into(), Value::String("block".into()));
                 stdout_obj.insert("reason".into(), Value::String(reason.clone()));
@@ -139,13 +139,13 @@ impl Adapter for ClaudeCodeAdapter {
                 AdapterResponse {
                     stdout,
                     stderr,
-                    exit_code: 2, // gryph PR #22 default: blocking exit
+                    exit_code: 2, // canonical Block exit code
                 }
             }
             HookDecision::Error(msg) => {
-                // Tooling-side errors don't block (gryph Issue #20:
-                // silent fail-open via async spawn was the bug to
-                // avoid; failing-open *with a loud stderr line* is the
+                // Tooling-side errors don't block (silent fail-open
+                // via async spawn was the prior bug to avoid;
+                // failing-open *with a loud stderr line* is the
                 // right answer for parser/io errors specifically).
                 let stderr = format!("[soth-code error] {msg}").into_bytes();
                 AdapterResponse {
@@ -184,10 +184,9 @@ fn action_type_for_hook(hook_type: &str, payload: &Value) -> ActionType {
     }
 }
 
-/// Tool name → action type. Matches gryph's `agent/claudecode/parser.go`
-/// `ToolNameMapping` table (gryph PR #32 reference). Preserves the
-/// canonical tool names Anthropic ships with `claude` 1.x; new tools
-/// land here as we observe them.
+/// Tool name → action type. Preserves the canonical tool names
+/// Anthropic ships with `claude` 1.x; new tools land here as we
+/// observe them.
 fn tool_to_action(tool_name: &str) -> ActionType {
     match tool_name {
         "Read" | "NotebookRead" => ActionType::FileRead,
@@ -220,14 +219,11 @@ fn extract_session_id(payload: &Value) -> String {
 /// string on `session_start` (`"claude-sonnet-4-5-20251022"`)
 /// and on some other events when the agent feels like it. For
 /// per-tool hooks (`pre_tool_use` / `post_tool_use`) the field
-/// is absent — gryph leaves Model empty in that case
-/// (`agent/claudecode/parser.go:48,261`). We do better by
-/// tailing `transcript_path` (a JSONL transcript path Claude
-/// Code includes in every hook payload) and reading the most
-/// recent assistant turn's `message.model`. Same source gryph
-/// uses for token-usage aggregation
-/// (`agent/claudecode/transcript.go:54`) — we just lift it
-/// for live event tagging instead of just billing.
+/// is absent. We work around this by tailing `transcript_path`
+/// (a JSONL transcript path Claude Code includes in every hook
+/// payload) and reading the most recent assistant turn's
+/// `message.model` — the same source typically used for token-
+/// usage aggregation, lifted here for live event tagging.
 fn extract_model(payload: &Value) -> Option<String> {
     if let Some(m) = payload.get("model").and_then(Value::as_str) {
         if !m.is_empty() {
@@ -275,10 +271,10 @@ fn last_assistant_model_from_transcript(path: &std::path::Path) -> Option<String
     None
 }
 
-/// Subagent fields per gryph PR #38: presence of `agent_id` (UUID) and
-/// `agent_type` (string identifier of the subagent class) is the
-/// authoritative signal. Both must be present; one without the other
-/// is treated as missing.
+/// Subagent fields: presence of `agent_id` (UUID) and `agent_type`
+/// (string identifier of the subagent class) is the authoritative
+/// signal. Both must be present; one without the other is treated as
+/// missing.
 fn extract_subagent(payload: &Value) -> Option<SubagentContext> {
     let agent_id = payload.get("agent_id").and_then(Value::as_str)?;
     let agent_type = payload.get("agent_type").and_then(Value::as_str)?;
@@ -370,7 +366,7 @@ mod tests {
 
     #[test]
     fn subagent_context_extracted_when_agent_id_and_type_present() {
-        // gryph PR #38: subagent attribution requires *both* fields.
+        // Subagent attribution requires *both* fields.
         let a = ClaudeCodeAdapter::new();
         let payload = br#"{
             "session_id": "sess-sub",
@@ -388,9 +384,9 @@ mod tests {
 
     #[test]
     fn subagent_context_absent_when_only_agent_id_set() {
-        // gryph PR #38: we explicitly require *both* fields. One alone
-        // is treated as missing rather than fabricating a partial
-        // context, since real Claude Code payloads always send the pair.
+        // We explicitly require *both* fields. One alone is treated as
+        // missing rather than fabricating a partial context, since real
+        // Claude Code payloads always send the pair.
         let a = ClaudeCodeAdapter::new();
         let payload = br#"{
             "session_id": "s",
@@ -443,8 +439,8 @@ mod tests {
 
     #[test]
     fn tool_response_array_does_not_crash_parser() {
-        // gryph PR #32: real MCP tool responses are sometimes arrays
-        // even though docs say objects. Adapter must not crash.
+        // Real MCP tool responses are sometimes arrays even though
+        // docs say objects. Adapter must not crash.
         let a = ClaudeCodeAdapter::new();
         let payload = br#"{
             "session_id": "s",
@@ -482,9 +478,9 @@ mod tests {
 
     #[test]
     fn render_block_trims_stderr_whitespace() {
-        // gryph PR #22 — trailing whitespace in block reasons looks
-        // like a trailing newline / extra padding to the agent and
-        // sometimes shows in the user-visible error.
+        // Trailing whitespace in block reasons looks like a trailing
+        // newline / extra padding to the agent and sometimes shows in
+        // the user-visible error.
         let a = ClaudeCodeAdapter::new();
         let r = a.render_decision(&HookDecision::Block {
             reason: "   denied   \n".into(),
@@ -517,8 +513,8 @@ mod tests {
     #[test]
     fn extract_model_from_transcript_tail_when_payload_lacks_it() {
         // Per-tool hooks (`pre_tool_use`) don't carry model in
-        // their payload — gryph leaves Model empty here.  We do
-        // better by tailing transcript_path's JSONL.
+        // their payload.  We work around this by tailing
+        // transcript_path's JSONL.
         let dir = tempfile::tempdir().unwrap();
         let transcript = dir.path().join("session.jsonl");
         std::fs::write(

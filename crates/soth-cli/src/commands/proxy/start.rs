@@ -126,11 +126,15 @@ pub async fn run(
         let key_meta = std::fs::metadata(&key_path)?;
         let mode = key_meta.mode() & 0o777;
         if mode & 0o077 != 0 {
-            tracing::warn!(
-                path = %key_path.display(),
-                mode = format!("{:o}", mode),
-                "CA private key has overly permissive file permissions. \
-                 Expected 0600, got {:o}. Run: chmod 600 {}",
+            // The CA private key is the trust root for every TLS interception
+            // the proxy performs. If group/other can read it, any local user
+            // can sign certs for any domain the user later visits. Refuse to
+            // start until the operator chmods it back to 0600 — warning was
+            // not enough.
+            anyhow::bail!(
+                "CA private key at {} has overly permissive file permissions \
+                 ({:o}). Expected 0600. Fix with: chmod 600 {}",
+                key_path.display(),
                 mode,
                 key_path.display()
             );
@@ -210,6 +214,39 @@ pub async fn run(
         } else {
             None
         };
+
+    // Phase 4 hot-update auto-applier. Polls ~/.soth/run/update_pending.json
+    // every 60s and runs the same `soth update --apply` path the user
+    // would run, but only for offers with urgency=Forced. Notify and
+    // Recommended urgencies remain user-driven.
+    //
+    // Windows is supported: the swap path on that OS spawns the
+    // `soth-update.exe` sidecar (Phase 4b), exits the daemon to
+    // release the exclusive .exe lock, and lets the sidecar do the
+    // `MoveFileExW` swap plus restart via `sc start soth` (or a
+    // direct spawn fallback for user-mode installs). The earlier
+    // Windows gate here was a leftover safety from before the
+    // sidecar landed; verified end-to-end with the 0.1.0 → 0.1.1
+    // smoke test today.
+    //
+    // Enterprise / deployment-guide override: SOTH_DISABLE_AUTO_APPLY=1
+    // skips the supervisor entirely. Cheaper than threading a config
+    // flag through cli_config for the 0.1.5 cut.
+    let _update_applier_supervisor: Option<tokio::task::JoinHandle<()>> = {
+        let auto_apply_disabled = std::env::var("SOTH_DISABLE_AUTO_APPLY")
+            .map(|v| {
+                let v = v.trim();
+                !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
+            })
+            .unwrap_or(false);
+        if auto_apply_disabled {
+            None
+        } else {
+            Some(tokio::spawn(async move {
+                super::update_applier::run().await;
+            }))
+        }
+    };
 
     // Engage the OS-level system proxy so traffic actually flows through us.
     // Reached by both foreground (`soth up --foreground`) and daemon-child

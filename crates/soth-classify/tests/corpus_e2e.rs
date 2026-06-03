@@ -560,6 +560,7 @@ fn build_detect_result(request: &RequestInput, context: &ContextInput) -> Detect
         first_blob_event_id: None,
         import_categories: Vec::new(),
         user_prompt: None,
+        raw_body_bytes: None,
     }
 }
 

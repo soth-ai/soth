@@ -26,7 +26,7 @@ pub enum HookDecision {
     /// Block the action. `reason` is the human-readable message; some
     /// adapters route it via stderr, others embed it in stdout JSON.
     /// `guidance` is a longer human-readable hint (Claude Code surfaces
-    /// it as a tool-output guidance message — gryph PR #35).
+    /// it as a tool-output guidance message).
     Block {
         reason: String,
         guidance: Option<String>,
@@ -46,9 +46,9 @@ pub struct AdapterResponse {
     /// agent expects it; empty for plain Allow under most adapters).
     pub stdout: Vec<u8>,
     /// Bytes to write to stderr (typically a trimmed human-readable
-    /// reason on Block; empty on Allow). gryph PR #22 found that
-    /// trailing whitespace in block reasons produced confusing UX —
-    /// adapters should trim before rendering.
+    /// reason on Block; empty on Allow). Trailing whitespace in block
+    /// reasons produces confusing UX — adapters should trim before
+    /// rendering.
     pub stderr: Vec<u8>,
     pub exit_code: i32,
 }

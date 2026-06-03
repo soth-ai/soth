@@ -2,19 +2,17 @@
 //!
 //! For each Phase-3 adapter (Pi Agent, Gemini CLI, Codex, Windsurf,
 //! OpenCode), walk the agent's fixture directory and assert every
-//! payload parses cleanly. The directory layout is shaped by gryph's
-//! upstream filename conventions — fixtures are named after what
-//! they represent (e.g. `pre_tool_use_bash`, `tool_call_read`)
-//! rather than the canonical hook_type the adapter expects, so this
-//! test treats the directory name as the hook_type hint and relies
-//! on each adapter's permissive fallback (unknown hook_type →
+//! payload parses cleanly. Fixtures are named after what they
+//! represent (e.g. `pre_tool_use_bash`, `tool_call_read`) rather
+//! than the canonical hook_type the adapter expects, so this test
+//! treats the directory name as the hook_type hint and relies on
+//! each adapter's permissive fallback (unknown hook_type →
 //! `ActionType::Notification`) rather than asserting specific
 //! action_type mappings here. The per-hook semantic mappings are
 //! pinned in each adapter's own unit tests.
 //!
 //! Failure here means: parser crashes on a real upstream payload
-//! shape — the gryph PR #29 / #32 / #38 class of regression. CI red
-//! light is the right response.
+//! shape — the regression class CI is meant to catch.
 
 use std::fs;
 use std::path::Path;
@@ -103,7 +101,7 @@ fn every_phase3_agent_has_fixtures() {
         let dirs = hook_type_dirs(case.dir);
         assert!(
             !dirs.is_empty(),
-            "agent {} has no fixture directories — port from gryph testdata",
+            "agent {} has no fixture directories — capture real-session payloads first",
             case.name
         );
     }
@@ -152,8 +150,7 @@ fn every_fixture_parses_for_every_agent() {
 
 #[test]
 fn each_agent_meets_minimum_fixture_count() {
-    // Per docs/gryph/implementation.md D-2: each new adapter ships
-    // ≥10 captured payloads (Phase 1 gate). Phase 3 keeps this bar.
+    // Each new adapter must ship ≥10 captured payloads.
     for case in agents() {
         let count: usize = hook_type_dirs(case.dir)
             .iter()
@@ -163,7 +160,7 @@ fn each_agent_meets_minimum_fixture_count() {
         assert!(
             count >= minimum,
             "agent {} has {count} fixtures; minimum is {minimum}. Capture more from real \
-             {} sessions or extend gryph testdata.",
+             {} sessions.",
             case.name,
             case.name
         );

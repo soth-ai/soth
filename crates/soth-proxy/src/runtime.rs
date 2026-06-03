@@ -192,15 +192,49 @@ async fn run_inner(ext_registry: Option<ExtensionRegistry>) -> Result<()> {
 
     let ops_task = {
         let ops_bind = config.pipeline.ops_bind.clone();
-        let ops_state = Arc::new(crate::ops_server::OpsState {
-            startup_time: Instant::now(),
-            db_path: config.db_path.clone(),
+        let token_path = dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".soth")
+            .join("ops.token");
+        // Generate or read the ops bearer token. On failure we deliberately
+        // abandon starting the ops server rather than fall back to no-auth —
+        // /reload and /metrics are sensitive and must never be reachable
+        // without credentials.
+        let auth_token = match crate::ops_server::generate_or_load_token(&token_path) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    path = %token_path.display(),
+                    "failed to generate or load ops bearer token; ops server will not start"
+                );
+                None
+            }
+        };
+        let enforce_loopback_host = crate::ops_server::bind_is_loopback(&ops_bind);
+        let ops_state = auth_token.map(|token| {
+            Arc::new(crate::ops_server::OpsState {
+                startup_time: Instant::now(),
+                db_path: config.db_path.clone(),
+                auth_token: token,
+                enforce_loopback_host,
+            })
         });
         tokio::spawn(async move {
             if ops_bind.is_empty() {
                 tracing::info!("ops server disabled (pipeline.ops_bind is empty)");
                 return;
             }
+            let ops_state = match ops_state {
+                Some(s) => s,
+                None => {
+                    tracing::warn!(
+                        bind = %ops_bind,
+                        "ops server skipped: auth token unavailable"
+                    );
+                    return;
+                }
+            };
             match tokio::net::TcpListener::bind(&ops_bind).await {
                 Ok(listener) => {
                     tracing::info!(bind = %ops_bind, "ops server started");
@@ -469,15 +503,49 @@ async fn run_inner() -> Result<()> {
 
     let ops_task = {
         let ops_bind = config.pipeline.ops_bind.clone();
-        let ops_state = Arc::new(crate::ops_server::OpsState {
-            startup_time: Instant::now(),
-            db_path: config.db_path.clone(),
+        let token_path = dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".soth")
+            .join("ops.token");
+        // Generate or read the ops bearer token. On failure we deliberately
+        // abandon starting the ops server rather than fall back to no-auth —
+        // /reload and /metrics are sensitive and must never be reachable
+        // without credentials.
+        let auth_token = match crate::ops_server::generate_or_load_token(&token_path) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    path = %token_path.display(),
+                    "failed to generate or load ops bearer token; ops server will not start"
+                );
+                None
+            }
+        };
+        let enforce_loopback_host = crate::ops_server::bind_is_loopback(&ops_bind);
+        let ops_state = auth_token.map(|token| {
+            Arc::new(crate::ops_server::OpsState {
+                startup_time: Instant::now(),
+                db_path: config.db_path.clone(),
+                auth_token: token,
+                enforce_loopback_host,
+            })
         });
         tokio::spawn(async move {
             if ops_bind.is_empty() {
                 tracing::info!("ops server disabled (pipeline.ops_bind is empty)");
                 return;
             }
+            let ops_state = match ops_state {
+                Some(s) => s,
+                None => {
+                    tracing::warn!(
+                        bind = %ops_bind,
+                        "ops server skipped: auth token unavailable"
+                    );
+                    return;
+                }
+            };
             match tokio::net::TcpListener::bind(&ops_bind).await {
                 Ok(listener) => {
                     tracing::info!(bind = %ops_bind, "ops server started");

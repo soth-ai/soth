@@ -157,6 +157,147 @@ pub(crate) fn quote_binary_path(path: &Path) -> String {
     format!("\"{normalized}\"")
 }
 
+/// Resolve a Windows path to its 8.3 short-name (no spaces) via
+/// `GetShortPathNameW`. Returns `None` when the API fails or when 8.3
+/// is disabled on the volume (detectable: the API returns the long
+/// path unchanged).
+///
+/// Why this exists: most agents (Claude Code, Cursor, Gemini, Windsurf,
+/// OpenCode, Pi Agent) pipe the hook command through a shell — cmd.exe,
+/// Git Bash, or sh — which honors double-quotes around paths with
+/// spaces. Codex Desktop is the exception: its hook runner uses Node.js
+/// `child_process.spawn` with `shell: false`, naively tokenizing the
+/// command string on whitespace without parsing quotes. A path like
+/// `"C:/Users/Prabhat ACER/.local/bin/soth.exe"` (the safe form for
+/// shell-based runners) tokenizes as `["\"C:/Users/Prabhat", …]` —
+/// token-0 is not a real file → ENOENT → silent "hook failed" in Codex
+/// chat with no spawn ever reaching soth.exe.
+///
+/// The 8.3 short name (`C:\Users\PRABHA~1\LOCAL~1\bin\soth.exe`) has
+/// no spaces, so it survives whitespace tokenization as a single token
+/// and points at the same file via NTFS's 8.3 alias layer. Using it as
+/// the executable token uniformly across all Windows agents fixes Codex
+/// without breaking the shell-based agents (they accept a no-space
+/// unquoted path just fine).
+///
+/// The `unsafe` exception is narrow: the FFI calls follow Microsoft's
+/// documented contract for `GetShortPathNameW` (UTF-16 wide-char input,
+/// caller-provided output buffer sized in u16 units, returns chars
+/// written or zero on failure). No raw pointer arithmetic, no aliasing,
+/// no escaping the function. See the crate-level lint comment in
+/// `lib.rs` for the broader rationale.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn windows_short_path(path: &Path) -> Option<String> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    extern "system" {
+        fn GetShortPathNameW(
+            lpsz_long_path: *const u16,
+            lpsz_short_path: *mut u16,
+            cch_buffer: u32,
+        ) -> u32;
+    }
+
+    let long: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // MAX_PATH is 260 on classic Windows; 8.3 short paths fit comfortably
+    // but we ask the API how much it needs first to handle long-path-aware
+    // installs.
+    let needed = unsafe { GetShortPathNameW(long.as_ptr(), std::ptr::null_mut(), 0) };
+    if needed == 0 {
+        return None;
+    }
+    let mut buf = vec![0u16; needed as usize];
+    let written = unsafe { GetShortPathNameW(long.as_ptr(), buf.as_mut_ptr(), needed) };
+    if written == 0 || written as usize >= buf.len() {
+        return None;
+    }
+    buf.truncate(written as usize);
+    let short = OsString::from_wide(&buf).to_string_lossy().into_owned();
+    // 8.3 disabled? The API silently returns the long path unchanged in
+    // that case. Detect by comparing case-insensitively against the
+    // original, normalized to the same path-separator convention.
+    let original_normalized = path.display().to_string().replace('\\', "/");
+    let short_normalized = short.replace('\\', "/");
+    if short_normalized.eq_ignore_ascii_case(&original_normalized) {
+        return None;
+    }
+    Some(short_normalized)
+}
+
+/// The executable token to put at the start of an agent's hook command.
+///
+/// Goal: produce a token that works for **every** agent, regardless of
+/// whether it pipes the command through a shell (Claude Code, Cursor,
+/// Gemini, Windsurf, OpenCode, Pi Agent) or invokes a raw spawn that
+/// tokenizes naively on whitespace and ignores quotes (Codex Desktop's
+/// Node.js `child_process.spawn` with `shell: false`).
+///
+/// The safety contract is: **the token must be parseable as a single
+/// argv[0] both by a quote-aware shell tokenizer and by a naive
+/// whitespace splitter**. That means:
+/// - No unquoted internal whitespace (would split for the naive parser)
+/// - No literal leading/trailing quote characters in the filename
+///   (would be passed verbatim to the OS by the naive parser, ENOENT)
+///
+/// ### Branch picking
+///
+/// On **Windows**:
+/// 1. If the long path contains no whitespace → emit the forward-
+///    slash-normalized long path **unquoted**. Already safe for both
+///    parsers; quoting it would actively break Codex Desktop because
+///    its naive parser keeps the leading quote as part of the filename.
+/// 2. If the long path contains whitespace → try the 8.3 short-name
+///    form via [`windows_short_path`]. A successful resolve yields a
+///    no-space alternate alias (e.g. `C:\Users\PRABHA~1\…`) usable
+///    unquoted by every spawner.
+/// 3. If 8.3 is unavailable (disabled per-volume, or the file does not
+///    yet exist on disk so `GetShortPathNameW` can't query NTFS) →
+///    fall back to the standard quoted long path. Shell-based agents
+///    still work; Codex Desktop will fail at install-time and the
+///    surfacing of that case is done by the doctor command.
+///
+/// On **non-Windows** (Linux / macOS):
+/// - Always emit `quote_binary_path(...)`. POSIX shells respect double-
+///   quoted paths uniformly; macOS Codex Desktop with a space-bearing
+///   home directory remains a known limitation tracked separately
+///   (there's no 8.3 equivalent on APFS / ext4; mitigations would
+///   require a no-space symlink at install time, which is heavier).
+fn executable_token(binary_path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        let normalized = binary_path.display().to_string().replace('\\', "/");
+        // No-whitespace happy path: every spawner can run an unquoted
+        // path that has no internal whitespace. Quoting it would
+        // regress Codex Desktop without helping anyone else.
+        if !normalized.chars().any(|c| c.is_whitespace()) {
+            return normalized;
+        }
+        // Space-bearing path: try the 8.3 short-name alias.
+        if let Some(short) = windows_short_path(binary_path) {
+            // Defense-in-depth: the API can technically return a path
+            // that still contains whitespace on some exotic volumes
+            // (FAT12 with 8.3 disabled, etc.). Only accept results we
+            // can use unquoted.
+            if !short.chars().any(|c| c.is_whitespace()) {
+                return short;
+            }
+        }
+        // 8.3 unavailable. Fall through to the quoted long-path form
+        // below — this is the same behavior as before the 8.3 work
+        // landed, so shell-based agents keep working. Codex Desktop
+        // will fail and `soth code doctor` should warn the operator
+        // about the 8.3-disabled volume.
+    }
+
+    quote_binary_path(binary_path)
+}
+
 pub fn default_claude_settings_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude").join("settings.json"))
 }
@@ -225,34 +366,40 @@ pub fn default_pi_agent_plugin_path() -> Option<PathBuf> {
 
 /// Default OpenCode plugin location.
 ///
-/// Per-OS resolution:
-/// - macOS / Linux: `~/.config/opencode/plugins/soth-code.mjs`
-/// - Windows: `%APPDATA%\opencode\plugins\soth-code.mjs`
+/// OpenCode uses an XDG-style layout on **every** platform —
+/// `~/.config/opencode/plugins/soth-code.js` on macOS, Linux, and
+/// Windows. On Windows that resolves to `C:\Users\<user>\.config\
+/// opencode\plugins\soth-code.js` (a literal `.config` directory
+/// under the user profile, NOT `%APPDATA%\Roaming\`).
 ///
-/// OpenCode on Windows explicitly bypasses the XDG /
-/// `~/.config/` convention and forces `%APPDATA%\opencode\`
-/// (verified upstream — see opencode-antigravity-auth issue
-/// #251 / #265 / #295 acknowledging the platform-specific
-/// override).  Without the cfg(windows) branch the install
-/// command would write to `%USERPROFILE%\.config\opencode\
-/// plugins\` which OpenCode does not read on Windows.  gryph
-/// upstream's `agent/opencode/detect.go` also misses this
-/// (single platform-agnostic `~/.config/opencode` constant);
-/// our fix is the upstream fix.
+/// **Source of truth (upstream OpenCode):**
+/// - Config dir resolution: `packages/core/src/global.ts` imports
+///   `xdgConfig` from the `xdg-basedir` npm package; that package
+///   falls back to `path.join(homedir(), '.config')` on every
+///   platform — there is no `%APPDATA%` branch. So Windows resolves
+///   to `<USERPROFILE>\.config\opencode` for config, data, log,
+///   state, and the `plugins/` subdir alike.
+/// - Plugin auto-discovery: `packages/opencode/src/config/plugin.ts`
+///   scans loose files in the plugins dir with the glob
+///   `{plugin,plugins}/*.{ts,js}`. Only `.ts` and `.js` are
+///   matched; `.mjs`, `.cjs`, and `.tsx` files at the top of the
+///   plugins directory are silently skipped by auto-discovery.
+///   That is why this path emits `soth-code.js` rather than
+///   `soth-code.mjs`.
+///
+/// An earlier version of this function used `dirs::config_dir()`
+/// on Windows, which resolves to `%APPDATA%\Roaming\`, and wrote
+/// `soth-code.mjs`. Both halves of that path were wrong: OpenCode
+/// never reads from `%APPDATA%`, and even if it had, `.mjs` files
+/// would be filtered out by the `{ts,js}` glob. Installs reported
+/// success but the plugin silently never fired.
 pub fn default_opencode_plugin_path() -> Option<PathBuf> {
-    #[cfg(windows)]
-    {
-        dirs::config_dir().map(|c| c.join("opencode").join("plugins").join("soth-code.mjs"))
-    }
-    #[cfg(not(windows))]
-    {
-        dirs::home_dir().map(|h| {
-            h.join(".config")
-                .join("opencode")
-                .join("plugins")
-                .join("soth-code.mjs")
-        })
-    }
+    dirs::home_dir().map(|h| {
+        h.join(".config")
+            .join("opencode")
+            .join("plugins")
+            .join("soth-code.js")
+    })
 }
 
 /// One row in the auto-detection result — the agent the
@@ -712,15 +859,34 @@ const WINDSURF_HOOK_TYPES: &[(&str, &str)] = &[
 /// natively; we normalize at install time so the hook subprocess
 /// accepts a uniform CLI shape across all agents.
 const CURSOR_HOOK_TYPES: &[(&str, &str)] = &[
-    // Pre-action (can block)
+    // Pre-action (can block) — every entry here mirrors a hook the
+    // adapter knows how to parse + `is_pre_action_hook()` allows.
+    // Coverage gap closed: `beforeMCPExecution` (credential leak
+    // surface), `beforeTabFileRead` (Cursor Tab file-read gate),
+    // and `subagentStart` (subagent fan-out) were previously only
+    // adapter-parseable — not installed, so they never fired.
     ("preToolUse", "pre_tool_use"),
     ("beforeShellExecution", "before_shell_execution"),
     ("beforeReadFile", "before_read_file"),
+    ("beforeTabFileRead", "before_tab_file_read"),
+    ("beforeMCPExecution", "before_mcp_execution"),
     ("beforeSubmitPrompt", "before_submit_prompt"),
+    ("subagentStart", "subagent_start"),
     // Post-action (audit)
     ("postToolUse", "post_tool_use"),
+    // `postToolUseFailure` fires when Cursor's tool call returned an
+    // error — high-signal for audit (failed file writes, blocked
+    // shells, denied API calls). Parser already handles it
+    // (`adapter/cursor.rs:231` collapses with `post_tool_use` for
+    // ActionType), so installing it just turns on the visibility.
+    ("postToolUseFailure", "post_tool_use_failure"),
     ("afterFileEdit", "after_file_edit"),
+    ("afterTabFileEdit", "after_tab_file_edit"),
     ("afterShellExecution", "after_shell_execution"),
+    ("afterMCPExecution", "after_mcp_execution"),
+    ("afterAgentResponse", "after_agent_response"),
+    ("afterAgentThought", "after_agent_thought"),
+    ("subagentStop", "subagent_stop"),
     // Lifecycle
     ("sessionStart", "session_start"),
     ("sessionEnd", "session_end"),
@@ -1068,7 +1234,7 @@ fn ensure_matcher_entry(
                 "type": "command",
                 "command": format!(
                     "{} code hook --agent {} --type {}",
-                    quote_binary_path(binary_path),
+                    executable_token(binary_path),
                     agent,
                     soth_hook_type
                 )
@@ -1285,7 +1451,7 @@ fn ensure_cursor_hook_entry(
         SOTH_MARKER_KEY: true,
         "command": format!(
             "{} code hook --agent {} --type {}",
-            quote_binary_path(binary_path),
+            executable_token(binary_path),
             agent,
             soth_hook_type
         )
@@ -1373,7 +1539,7 @@ fn ensure_hook_entry(
                 "type": "command",
                 "command": format!(
                     "{} code hook --agent claude_code --type {}",
-                    quote_binary_path(binary_path),
+                    executable_token(binary_path),
                     soth_hook_type
                 )
             }
@@ -1443,6 +1609,99 @@ fn kind_label(v: &Value) -> &'static str {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Doctor / status helpers — exposed so the CLI can synthesize one row per
+// agent that combines (settings file marker count) + (installed.json record)
+// + (binary drift). Previously the doctor only grep'd for the marker
+// substring, which couldn't distinguish "fully installed" from "hand-edited
+// down to one entry" from "marker text appears in a user comment".
+// ---------------------------------------------------------------------------
+
+/// Number of hook entries `install_*` writes for a given agent.
+/// `Some(N)` for JSON-config agents (claude_code, cursor, codex,
+/// gemini_cli, windsurf); `None` for plugin-file agents
+/// (opencode, pi_agent) — those don't have a per-hook count, just a
+/// single managed file.
+pub fn expected_hook_count(agent: &str) -> Option<usize> {
+    match agent {
+        "claude_code" => Some(HOOK_TYPES.len()),
+        "cursor" => Some(CURSOR_HOOK_TYPES.len()),
+        // The CLI surfaces codex as both names; both resolve to the
+        // same install. Mapping both keeps the doctor happy whether
+        // the caller passed `--target codex` or read `openai_codex`
+        // from installed.json.
+        "codex" | "openai_codex" => Some(CODEX_HOOK_TYPES.len()),
+        "gemini_cli" => Some(GEMINI_HOOK_TYPES.len()),
+        "windsurf" => Some(WINDSURF_HOOK_TYPES.len()),
+        _ => None,
+    }
+}
+
+/// Count the number of `_soth_managed: true` entries anywhere in the
+/// settings/hooks JSON at `path`. Walks the entire tree so it works
+/// uniformly across both shapes we install:
+///
+/// - Matcher-style (claude_code, gemini_cli): the managed marker
+///   lives on the *outer* object that wraps a `matcher`+`hooks` pair.
+/// - Flat-style (cursor, codex, windsurf): the managed marker lives
+///   on the per-event command object.
+///
+/// A missing or empty file returns `Ok(0)` so the doctor can
+/// distinguish that case from a parse error. Malformed JSON
+/// surfaces `Err(InstallError::Malformed)` — same contract as the
+/// install side, so the doctor doesn't silently report "0 hooks"
+/// for a config the operator broke while editing.
+pub fn count_soth_managed_entries(path: &Path) -> Result<usize, InstallError> {
+    let content = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => {
+            return Err(InstallError::Read {
+                path: path.to_path_buf(),
+                source: e,
+            });
+        }
+    };
+    if content.trim().is_empty() {
+        return Ok(0);
+    }
+    let doc: Value = serde_json::from_str(&content).map_err(|e| InstallError::Malformed {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    Ok(count_marker_recursive(&doc))
+}
+
+fn count_marker_recursive(v: &Value) -> usize {
+    match v {
+        Value::Object(map) => {
+            // An object with `_soth_managed: true` counts itself as
+            // one entry — and we DON'T descend further, since the
+            // marker lives on leaf-ish wrapper objects (Claude Code's
+            // matcher object, Cursor's per-event command object) and
+            // descending would double-count nested arrays we don't
+            // own.
+            if map.get(SOTH_MARKER_KEY) == Some(&Value::Bool(true)) {
+                return 1;
+            }
+            map.values().map(count_marker_recursive).sum()
+        }
+        Value::Array(arr) => arr.iter().map(count_marker_recursive).sum(),
+        _ => 0,
+    }
+}
+
+/// True when the plugin file at `path` exists and contains the
+/// soth-managed marker comment line. Used by the doctor for the
+/// plugin-style agents (opencode, pi_agent) where there's no
+/// per-hook count, only a single file-presence + marker check.
+pub fn plugin_file_is_soth_managed(path: &Path) -> bool {
+    match fs::read_to_string(path) {
+        Ok(content) => content.contains(PLUGIN_MARKER_LINE),
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1474,25 +1733,210 @@ mod tests {
     }
 
     #[test]
-    fn install_claude_code_writes_quoted_command_for_space_path() {
-        // End-to-end: install on a space-bearing Windows path
-        // and confirm the resulting settings.json contains the
-        // forward-slash-normalized + double-quoted command.
-        // After deserialization the JSON value is exactly:
-        //   "C:/Users/Prabhat ACER/.local/bin/soth.exe" code hook --agent claude_code --type ...
-        // — which Claude Code's Git Bash / cmd.exe shell
-        // invokes correctly.
+    #[cfg(windows)]
+    fn windows_short_path_strips_spaces_for_existing_path() {
+        // Create a tempdir with a space in its name, drop a file inside,
+        // then verify `windows_short_path` returns a no-space alias.
+        // 8.3 short-names are enabled by default on NTFS; the test
+        // gracefully skips if the volume has them disabled (CI runners
+        // sometimes do).
+        let parent = tempfile::tempdir().unwrap();
+        let spaced_dir = parent.path().join("Prabhat ACER");
+        fs::create_dir(&spaced_dir).unwrap();
+        let file = spaced_dir.join("soth.exe");
+        fs::write(&file, b"stub").unwrap();
+
+        match windows_short_path(&file) {
+            Some(short) => {
+                assert!(
+                    !short.contains(' '),
+                    "8.3 short path must have no spaces, got: {short}"
+                );
+                assert!(
+                    short.to_ascii_lowercase().ends_with("soth.exe"),
+                    "short path must still resolve to soth.exe, got: {short}"
+                );
+            }
+            None => {
+                // 8.3 disabled on this volume — acceptable, the installer
+                // falls back to quoted long path for non-codex agents.
+                eprintln!("skipping assertion: 8.3 short names disabled on tempdir volume");
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn executable_token_on_windows_prefers_short_path_when_available() {
+        // End-to-end: when 8.3 is available, `executable_token` returns
+        // an unquoted no-space path. When 8.3 is disabled it falls back
+        // to the quoted long path. Either outcome is acceptable; this
+        // test pins the contract: if there's a space in the output, it
+        // MUST be inside quotes (shell-based agents still need that).
+        let parent = tempfile::tempdir().unwrap();
+        let spaced_dir = parent.path().join("Some User");
+        fs::create_dir(&spaced_dir).unwrap();
+        let file = spaced_dir.join("soth.exe");
+        fs::write(&file, b"stub").unwrap();
+
+        let token = executable_token(&file);
+        if token.contains(' ') {
+            assert!(
+                token.starts_with('"') && token.ends_with('"'),
+                "fallback long-path token must be quoted when it contains a space: {token}"
+            );
+        } else {
+            // Short-path branch.
+            assert!(
+                !token.starts_with('"'),
+                "short-path token must be unquoted (Codex Desktop tokenizes naively): {token}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn executable_token_on_unix_matches_quote_binary_path() {
+        // No 8.3 indirection on POSIX — `executable_token` collapses to
+        // `quote_binary_path` so the output is identical to today's
+        // behavior. Pinned so a future Windows-specific change doesn't
+        // accidentally regress the Unix path.
+        let p = PathBuf::from("/Users/dev/.local/bin/soth");
+        assert_eq!(executable_token(&p), quote_binary_path(&p));
+
+        // Space-bearing POSIX path stays quoted — POSIX shells respect
+        // the quotes uniformly, and we have no 8.3 alternative to fall
+        // back on here.
+        let p_space = PathBuf::from("/Users/John Doe/.local/bin/soth");
+        let token = executable_token(&p_space);
+        assert!(
+            token.starts_with('"'),
+            "POSIX space path must be quoted: {token}"
+        );
+        assert!(
+            token.ends_with('"'),
+            "POSIX space path must be quoted: {token}"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn executable_token_on_windows_unquotes_no_space_path() {
+        // For a Windows path that already has no whitespace, the safe
+        // token is the path itself — unquoted. Quoting it would actively
+        // break Codex Desktop's naive spawner because the leading `"`
+        // becomes part of the filename it tries to exec.
+        let no_space = PathBuf::from(r"C:\soth\bin\soth.exe");
+        let token = executable_token(&no_space);
+        assert_eq!(token, "C:/soth/bin/soth.exe");
+        assert!(!token.starts_with('"'));
+        assert!(!token.contains(' '));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn executable_token_on_windows_uses_short_path_for_existing_space_path() {
+        // A real space-bearing directory that exists on disk: 8.3 must
+        // resolve and the resulting token must have no whitespace and
+        // no quotes (the unquoted-short branch).
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("Some User Name");
+        fs::create_dir(&dir).unwrap();
+        let file = dir.join("soth.exe");
+        fs::write(&file, b"stub").unwrap();
+
+        let token = executable_token(&file);
+        // Either short-path branch (no whitespace, no quotes) OR fallback
+        // (quoted long path) — the second only fires on 8.3-disabled
+        // volumes, which most modern Windows volumes are not.
+        if !token.starts_with('"') {
+            assert!(
+                !token.chars().any(|c| c.is_whitespace()),
+                "short-path token must be whitespace-free: {token}"
+            );
+            assert!(
+                token.to_ascii_lowercase().ends_with("soth.exe"),
+                "short-path token must resolve to soth.exe: {token}"
+            );
+        } else {
+            assert!(
+                token.ends_with('"'),
+                "fallback branch must produce a fully-quoted token: {token}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn executable_token_on_windows_falls_back_for_nonexistent_space_path() {
+        // GetShortPathNameW only resolves real files. A space-bearing
+        // path that does NOT exist on disk yet (no installer can assume
+        // the binary is in place at every callsite) must gracefully fall
+        // back to the quoted long path so the install still produces a
+        // syntactically valid command. Codex hooks won't work for users
+        // in this state, but Claude Code / Cursor still will.
+        let bogus = PathBuf::from(r"C:\Users\Definitely Not A Real User\bin\soth.exe");
+        let token = executable_token(&bogus);
+        assert!(token.starts_with('"'), "fallback must quote: {token}");
+        assert!(token.ends_with('"'), "fallback must quote: {token}");
+        assert!(token.contains(' '), "fallback preserves long path: {token}");
+    }
+
+    #[test]
+    fn install_claude_code_writes_runnable_command_for_space_path() {
+        // End-to-end: install on a space-bearing Windows path and
+        // confirm the resulting settings.json contains a command that
+        // any hook spawner — shell-based (Claude Code, Cursor) OR raw-
+        // spawn (Codex Desktop) — can execute.
+        //
+        // The earlier contract pinned the quoted long-path form
+        // (`"C:/Users/Prabhat ACER/.../soth.exe"`) — fine for shell-
+        // based runners but broken on Codex Desktop's Node.js
+        // `child_process.spawn` with `shell: false`, which tokenizes
+        // naively on whitespace and ignores quotes. We now prefer the
+        // Windows 8.3 short-name form (no spaces → no quoting needed)
+        // and fall back to the quoted form when 8.3 is disabled. Both
+        // are acceptable; the test pins the safety property: the
+        // resulting command must either have no spaces in the
+        // executable token, or have any space contained inside quotes.
         let space_path = PathBuf::from(r"C:\Users\Prabhat ACER\.local\bin\soth.exe");
         let (_tmp, settings_path) = fixture_settings("");
         install_claude_code(&settings_path, Some(space_path)).unwrap();
         let body = fs::read_to_string(&settings_path).unwrap();
-        // JSON-encoded: `\"` for inner double-quotes.  No
-        // backslashes in the path so no `\\` escapes either —
-        // exactly the hand-readable shape engineers want.
-        assert!(
-            body.contains(r#""\"C:/Users/Prabhat ACER/.local/bin/soth.exe\""#),
-            "settings.json must embed forward-slashed quoted path; got: {body}"
-        );
+        let doc: Value = serde_json::from_str(&body).unwrap();
+        let cmd = doc["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .expect("PreToolUse hook command must be a string");
+
+        // The executable token is everything up to the first un-quoted
+        // space. Either: starts with `"` and matches `"…"` (quoted long
+        // path) OR starts with a non-quote char and contains no spaces
+        // up to the first whitespace (short path).
+        if cmd.starts_with('"') {
+            // Quoted long path branch — closing quote must arrive
+            // before any unquoted space.
+            let after_open = &cmd[1..];
+            let close = after_open
+                .find('"')
+                .expect("quoted exe token must have a closing quote");
+            let exe = &after_open[..close];
+            assert!(
+                exe.contains("soth"),
+                "quoted exe token must reference soth: {exe}"
+            );
+        } else {
+            // Short-path branch — no spaces in the exe token at all.
+            let first_space = cmd.find(' ').expect("command must have args after exe");
+            let exe = &cmd[..first_space];
+            assert!(
+                !exe.contains(' '),
+                "unquoted exe token must not contain spaces: {exe}"
+            );
+            assert!(
+                exe.to_ascii_lowercase().ends_with("soth.exe"),
+                "unquoted exe token must end in soth.exe: {exe}"
+            );
+        }
     }
 
     fn fixture_settings(content: &str) -> (tempfile::TempDir, PathBuf) {
@@ -1728,6 +2172,61 @@ mod tests {
     }
 
     #[test]
+    fn cursor_install_covers_all_adapter_known_hooks() {
+        // Regression guard: every soth-side hook name in
+        // CURSOR_HOOK_TYPES must be one the CursorAdapter recognizes
+        // (returns a non-`Notification` ActionType OR is the literal
+        // session_end / stop lifecycle hook). Catches the class of
+        // drift bug that left `beforeMCPExecution`, `beforeTabFileRead`
+        // etc. adapter-parseable but never installed.
+        use crate::adapter::{Adapter as _, CursorAdapter};
+        let a = CursorAdapter::new();
+        for (cursor_event, soth_hook_type) in CURSOR_HOOK_TYPES {
+            let parsed = a
+                .parse_event(soth_hook_type, b"{\"conversation_id\":\"c\"}")
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "CursorAdapter must parse hook {cursor_event} → {soth_hook_type} \
+                         that install.rs registers"
+                    )
+                });
+            assert_eq!(
+                parsed.hook_type, *soth_hook_type,
+                "adapter must preserve installed hook_type verbatim"
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_install_writes_extended_hook_coverage() {
+        // Pins the post-PR coverage: we install the full set
+        // (pre_action + post_action + lifecycle), not just the
+        // original 10. Bump intentionally if/when the set changes.
+        let (_tmp, path) = fixture_settings("");
+        let report = install_cursor(&path, Some(binary_path())).unwrap();
+        assert_eq!(report.hooks_added.len(), CURSOR_HOOK_TYPES.len());
+        assert!(
+            CURSOR_HOOK_TYPES.len() >= 19,
+            "cursor coverage should remain at-or-above 19 hooks (gryph parity + postToolUseFailure)"
+        );
+        let body: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        // Spot-check newly added hooks land in the file.
+        for new_event in [
+            "beforeMCPExecution",
+            "beforeTabFileRead",
+            "subagentStart",
+            "afterAgentResponse",
+            "afterMCPExecution",
+            "subagentStop",
+        ] {
+            assert!(
+                body["hooks"][new_event].is_array(),
+                "cursor must install hook for {new_event}"
+            );
+        }
+    }
+
+    #[test]
     fn cursor_install_still_writes_version_field() {
         // Regression guard: the shared `install_flat_style` helper is
         // also used by Cursor; the `version: 1` field should only
@@ -1736,6 +2235,94 @@ mod tests {
         super::install_cursor(&path, Some(binary_path())).unwrap();
         let body: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(body["version"], 1);
+    }
+
+    #[test]
+    fn expected_hook_count_matches_installed_per_agent() {
+        // Pin the doctor's expected-vs-actual comparison: every
+        // hook-based install must agree with `expected_hook_count`.
+        // Plugin-based agents return `None` since they ship a single
+        // file rather than per-event entries.
+        for (agent, install_fn) in [
+            (
+                "claude_code",
+                install_claude_code
+                    as fn(&Path, Option<PathBuf>) -> Result<InstallReport, InstallError>,
+            ),
+            ("cursor", install_cursor),
+            ("codex", install_codex),
+            ("gemini_cli", install_gemini_cli),
+            ("windsurf", install_windsurf),
+        ] {
+            let (_tmp, path) = fixture_settings("");
+            let report = install_fn(&path, Some(binary_path())).unwrap();
+            let expected =
+                expected_hook_count(agent).expect("hook-based agent must expose a count");
+            assert_eq!(
+                report.hooks_added.len(),
+                expected,
+                "install_{agent} must add exactly expected_hook_count() entries"
+            );
+            let counted = count_soth_managed_entries(&path).unwrap();
+            assert_eq!(
+                counted, expected,
+                "count_soth_managed_entries must agree with install for {agent}"
+            );
+        }
+        // Plugin-based agents return None: there's no per-hook count
+        // to compare; doctor falls back to plugin_file_is_soth_managed.
+        assert_eq!(expected_hook_count("opencode"), None);
+        assert_eq!(expected_hook_count("pi_agent"), None);
+        // Unknown agents return None too.
+        assert_eq!(expected_hook_count("unknown"), None);
+    }
+
+    #[test]
+    fn count_soth_managed_entries_handles_missing_empty_and_malformed() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Missing file: 0, not an error.
+        let missing = tmp.path().join("nope.json");
+        assert_eq!(count_soth_managed_entries(&missing).unwrap(), 0);
+        // Empty file: 0.
+        let empty = tmp.path().join("empty.json");
+        fs::write(&empty, "").unwrap();
+        assert_eq!(count_soth_managed_entries(&empty).unwrap(), 0);
+        // Malformed JSON: errors so the doctor surfaces the broken
+        // config instead of silently reporting "0 hooks" for a file
+        // the operator broke mid-edit.
+        let bad = tmp.path().join("bad.json");
+        fs::write(&bad, "{not json").unwrap();
+        assert!(matches!(
+            count_soth_managed_entries(&bad),
+            Err(InstallError::Malformed { .. })
+        ));
+        // Unmanaged file: 0 (operator's own hook, no marker).
+        let unmanaged = tmp.path().join("user.json");
+        fs::write(
+            &unmanaged,
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/usr/local/bin/their-hook"}]}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(count_soth_managed_entries(&unmanaged).unwrap(), 0);
+    }
+
+    #[test]
+    fn plugin_file_is_soth_managed_distinguishes_managed_from_unmanaged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let managed = tmp.path().join("soth-code.mjs");
+        install_opencode(&managed, Some(binary_path())).unwrap();
+        assert!(plugin_file_is_soth_managed(&managed));
+
+        let unmanaged = tmp.path().join("user.mjs");
+        fs::write(
+            &unmanaged,
+            "// the operator's own plugin\nexport default {};",
+        )
+        .unwrap();
+        assert!(!plugin_file_is_soth_managed(&unmanaged));
+
+        let missing = tmp.path().join("missing.mjs");
+        assert!(!plugin_file_is_soth_managed(&missing));
     }
 
     #[test]
@@ -1769,7 +2356,7 @@ mod tests {
     #[test]
     fn opencode_plugin_installs_with_binary_substituted() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("plugins").join("soth-code.mjs");
+        let path = tmp.path().join("plugins").join("soth-code.js");
         let report = install_opencode(&path, Some(binary_path())).unwrap();
         assert!(path.exists());
         let body = fs::read_to_string(&path).unwrap();
@@ -1778,6 +2365,60 @@ mod tests {
         assert!(body.contains("\"opencode\""));
         assert!(body.contains("\"tool_execute_before\""));
         assert_eq!(report.hooks_added, vec!["opencode plugin".to_string()]);
+    }
+
+    /// Windows-shaped paths embed characters JS treats as escape
+    /// sequences (`\U`, `\b`, `\.`). The installer must double-escape
+    /// every `\` before substitution; a raw `C:\Users\...` left
+    /// untouched produces a JS string literal that either fails to
+    /// parse or silently resolves to the wrong path (the `\b` becomes
+    /// a literal backspace at runtime). This test forces the bug to
+    /// surface even when the harness runs on a non-Windows host —
+    /// the substituted value must contain the doubled `\\` form, NOT
+    /// the raw single backslash that would survive a no-op install.
+    #[test]
+    fn opencode_plugin_escapes_backslashes_in_substituted_path() {
+        use std::path::PathBuf;
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_path = tmp.path().join("plugins").join("soth-code.js");
+        // Path crafted to contain characters that are JS escape
+        // sequences after a single backslash: `\U`, `\b`, `\s`, `\.`,
+        // plus a space (to mirror typical Windows user folders).
+        let synthetic = PathBuf::from(r"C:\Users\test user\.local\bin\soth.exe");
+        install_opencode(&plugin_path, Some(synthetic)).unwrap();
+        let body = fs::read_to_string(&plugin_path).unwrap();
+        // Must contain the JS-escaped form...
+        assert!(
+            body.contains(r#"const SOTH_BIN = "C:\\Users\\test user\\.local\\bin\\soth.exe""#),
+            "expected doubled `\\\\` escaping in substituted SOTH_BIN, got:\n{body}"
+        );
+        // ...and must NOT contain the raw, JS-invalid single-backslash
+        // form. Without `\\` doubling, `\b` becomes a backspace at
+        // runtime and the plugin silently spawns the wrong path.
+        assert!(
+            !body.contains(r#"const SOTH_BIN = "C:\Users"#),
+            "raw single-backslash path leaked into the installed plugin"
+        );
+    }
+
+    /// Counterpart to the Windows-escaping test: on Linux / macOS the
+    /// binary path has no `\`, so the same `replace('\\', "\\\\")`
+    /// must be a no-op — the substituted source should match the raw
+    /// path byte-for-byte. Locks in cross-platform correctness so a
+    /// future "fix" that gates the escape on `cfg!(windows)` can't
+    /// silently regress Unix installs.
+    #[test]
+    fn opencode_plugin_unix_path_substituted_verbatim() {
+        use std::path::PathBuf;
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_path = tmp.path().join("plugins").join("soth-code.js");
+        let unix = PathBuf::from("/home/test/.local/bin/soth");
+        install_opencode(&plugin_path, Some(unix)).unwrap();
+        let body = fs::read_to_string(&plugin_path).unwrap();
+        assert!(
+            body.contains(r#"const SOTH_BIN = "/home/test/.local/bin/soth""#),
+            "expected Unix path substituted verbatim with no extra escaping, got:\n{body}"
+        );
     }
 
     #[test]

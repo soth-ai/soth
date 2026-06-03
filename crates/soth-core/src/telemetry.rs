@@ -262,7 +262,7 @@ pub enum DataSource {
     HistorianUnknown,
     // ── soth-code extension: per-action live capture from agent hooks.
     //    Distinct from Historian* variants which are post-hoc session
-    //    backfill. See docs/gryph/plan.md §10 for layer boundaries.
+    //    backfill.
     CodeClaudeCode,
     CodeCursor,
     CodeCodex,
@@ -270,6 +270,13 @@ pub enum DataSource {
     CodeWindsurf,
     CodeOpenCode,
     CodePiAgent,
+    /// Code-extension event from an agent that doesn't match any of the
+    /// seven shipped adapter names. Mirrors `HistorianUnknown`: keeps
+    /// the event on the action layer instead of mis-attributing it to
+    /// Claude Code (the prior smoke-friendly default). Surfaces as the
+    /// "unknown" agent on the dashboard so operators can audit the
+    /// source rather than silently bucket it into someone else's tile.
+    CodeUnknown,
 }
 
 impl Default for DataSource {
@@ -280,8 +287,7 @@ impl Default for DataSource {
 
 /// Event-stream observation layer.
 ///
-/// SOTH observes AI agent activity at three orthogonal layers
-/// (→ `docs/gryph/plan.md` §10):
+/// SOTH observes AI agent activity at three orthogonal layers:
 ///
 /// - **Network** — proxy MITM observation, one event per HTTP request/response.
 /// - **Action** — `soth-code` hook capture, one event per agent tool call.
@@ -321,7 +327,8 @@ impl EventLayer {
             | DataSource::CodeGeminiCli
             | DataSource::CodeWindsurf
             | DataSource::CodeOpenCode
-            | DataSource::CodePiAgent => Self::Action,
+            | DataSource::CodePiAgent
+            | DataSource::CodeUnknown => Self::Action,
         }
     }
 }
@@ -480,7 +487,7 @@ pub struct TelemetryEvent {
     #[serde(default)]
     pub is_shadow_it: bool,
 
-    /// Event-stream observation layer tag (→ `docs/gryph/plan.md` §10).
+    /// Event-stream observation layer tag.
     /// `None` for legacy events; resolve via [`TelemetryEvent::effective_event_layer`]
     /// which falls back to deriving from `data_source`. New writers
     /// (`soth-code`, future explicit-layer producers) populate this.
@@ -599,7 +606,7 @@ impl TelemetryEvent {
     ///
     /// Returns the explicit `event_layer` field when set (new writers),
     /// otherwise derives from `data_source` for backwards compat with
-    /// legacy events that predate this field (→ `docs/gryph/plan.md` §10.6).
+    /// legacy events that predate this field.
     pub fn effective_event_layer(&self) -> EventLayer {
         self.event_layer
             .unwrap_or_else(|| EventLayer::from_data_source(self.data_source))
@@ -1028,6 +1035,7 @@ mod data_source_serde_tests {
             (DataSource::CodeWindsurf, "\"code_windsurf\""),
             (DataSource::CodeOpenCode, "\"code_open_code\""),
             (DataSource::CodePiAgent, "\"code_pi_agent\""),
+            (DataSource::CodeUnknown, "\"code_unknown\""),
         ];
         for (variant, expected) in cases {
             assert_eq!(
@@ -1048,6 +1056,7 @@ mod data_source_serde_tests {
             DataSource::CodeWindsurf,
             DataSource::CodeOpenCode,
             DataSource::CodePiAgent,
+            DataSource::CodeUnknown,
         ];
         for variant in variants {
             let json = serde_json::to_string(&variant).unwrap();

@@ -305,6 +305,9 @@ mod tests {
         );
     }
 
+    // Many-field test fixture; struct-update would push this into a
+    // single 30-field expression and hurt readability.
+    #[allow(clippy::field_reassign_with_default)]
     #[test]
     fn map_event_exports_rich_detection_fields() {
         let mut event = soth_core::TelemetryEvent::default();

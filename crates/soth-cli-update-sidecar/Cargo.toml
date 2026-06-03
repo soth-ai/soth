@@ -1,0 +1,24 @@
+[package]
+name = "soth-cli-update-sidecar"
+description = "Windows sidecar updater for soth (Phase 4b)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "soth-update"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+
+# Tiny dependency footprint by design — the sidecar must be small enough
+# to ship as a ~200 KB additional artifact and self-contained enough that
+# a bug in the main soth binary can't break the rollback path.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+] }

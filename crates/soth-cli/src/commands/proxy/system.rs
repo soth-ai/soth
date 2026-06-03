@@ -1347,8 +1347,6 @@ async fn check_linux_proxy_status() -> Result<bool> {
 
 #[cfg(target_os = "windows")]
 async fn configure_windows_proxy(enable: bool, port: u16, print_user_output: bool) -> Result<()> {
-    use std::os::windows::process::CommandExt;
-
     let proxy_server = format!("127.0.0.1:{}", port);
     let proxy_bypass = "localhost;127.0.0.1;::1;*.local;192.168.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;<local>";
 
@@ -1450,13 +1448,37 @@ async fn configure_windows_proxy(enable: bool, port: u16, print_user_output: boo
         }
     }
 
-    // Notify system of proxy change
-    let _ = Command::new("cmd")
-        .args(["/C", "RUNDLL32.EXE", "inetcpl.cpl,LaunchConnectionDialog"])
-        .creation_flags(0x08000000) // CREATE_NO_WINDOW
-        .output();
+    notify_windows_proxy_changed();
 
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn notify_windows_proxy_changed() {
+    use windows_sys::Win32::Networking::WinInet::{
+        InternetSetOptionW, INTERNET_OPTION_REFRESH, INTERNET_OPTION_SETTINGS_CHANGED,
+    };
+
+    // Two-call WinInet pattern: SETTINGS_CHANGED rebuilds proxy info from
+    // the registry, REFRESH forces existing handles to pick it up. Skipping
+    // either leaves long-lived HttpClient/.NET/WinInet consumers on stale
+    // settings. We previously called `rundll32 inetcpl.cpl,LaunchConnectionDialog`
+    // which surfaces the Internet Properties UI on every `soth proxy on/off`
+    // (and on autostart) — see #windows-startup-popup.
+    unsafe {
+        let _ = InternetSetOptionW(
+            std::ptr::null_mut(),
+            INTERNET_OPTION_SETTINGS_CHANGED,
+            std::ptr::null(),
+            0,
+        );
+        let _ = InternetSetOptionW(
+            std::ptr::null_mut(),
+            INTERNET_OPTION_REFRESH,
+            std::ptr::null(),
+            0,
+        );
+    }
 }
 
 #[cfg(target_os = "windows")]
