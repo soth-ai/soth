@@ -376,7 +376,6 @@ pub struct HeartbeatResponse {
 }
 
 /// Hot-update offer carried on `HeartbeatResponse`. Phase 2.
-/// See `docs/common/2026-05-09/hot-update-plan.md` §3.1.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UpdateAvailable {
     /// Target version (semver, e.g. "0.1.2").

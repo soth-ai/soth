@@ -21,6 +21,14 @@ OPS := ./ops/release.sh
 help:
 	$(OPS) help
 
+# Developer test gate: mirrors what CI runs (see CONTRIBUTING.md). Not part of
+# the ops/release.sh dispatch — it shells out to cargo directly.
+.PHONY: test
+test:
+	cargo test --workspace
+	cargo fmt --all -- --check
+	cargo clippy --workspace --all-targets -- -D warnings
+
 .PHONY: build-cli publish-cli release-cli verify-cli diff
 build-cli:
 	$(OPS) build-cli '$(ENV)'

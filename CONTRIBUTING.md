@@ -17,7 +17,7 @@ improvements from the community.
 You need:
 
 - **Rust 1.75+** with `cargo`. Install via [rustup](https://rustup.rs/).
-- **Node.js 20+** (only if you touch `bindings/soth-node/` or the dashboard).
+- **Node.js 20+** (only if you build the Node.js bindings at `bindings/soth-node/`).
 - **Python 3.11+** (only if you touch `bindings/soth-py/`).
 
 Clone and build:
@@ -31,8 +31,8 @@ cargo build --workspace
 Run the full test suite:
 
 ```bash
-make test                   # runs cargo test + fmt + clippy
-# or, individually:
+make test                   # cargo test + fmt --check + clippy -D warnings
+# or run the steps individually:
 cargo test --workspace
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings

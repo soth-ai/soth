@@ -23,7 +23,7 @@ body:
       label: Steps to reproduce
       description: Minimal steps that reliably trigger the bug.
       placeholder: |
-        1. Run `soth proxy setup-ca`
+        1. Run `soth setup-ca`
         2. Run `soth start --config soth.yaml`
         3. curl -x http://127.0.0.1:5074 https://api.openai.com/v1/models
         4. Crash
@@ -66,7 +66,7 @@ body:
     attributes:
       label: Relevant logs
       description: |
-        Output from `soth tail`, `~/.soth/logs/`, or the failing command.
+        Output from `soth logs -f`, `~/.soth/logs/`, or the failing command.
         **Please redact API keys, hostnames, and any sensitive data first.**
       render: shell
 

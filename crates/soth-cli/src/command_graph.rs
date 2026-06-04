@@ -99,7 +99,6 @@ pub enum Commands {
     },
 
     /// Check for or apply a soth release update
-    /// (`docs/common/2026-05-09/hot-update-plan.md`)
     Update(UpdateArgs),
 }
 
