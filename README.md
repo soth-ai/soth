@@ -1,65 +1,123 @@
-# Soth
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset=".github/assets/logo-white.svg" />
+    <source media="(prefers-color-scheme: light)" srcset=".github/assets/logo-black.svg" />
+    <img src=".github/assets/logo-black.svg" alt="Soth" width="120" />
+  </picture>
+</p>
 
-**An edge proxy and observability layer for AI agent traffic.**
+<h1 align="center">SOTH</h1>
 
-[![CI](https://github.com/soth-ai/soth/actions/workflows/ci.yml/badge.svg)](https://github.com/soth-ai/soth/actions/workflows/ci.yml)
-[![License: MPL 2.0](https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg)](https://www.mozilla.org/en-US/MPL/2.0/)
-[![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
+<p align="center">
+  <strong>An edge governance and observability platform for AI agent traffic.</strong>
+</p>
 
-Soth sits between your AI agents and the rest of the world. It captures, classifies,
-and governs MCP, HTTP, and AI provider traffic — so you can see what your agents are
-doing, enforce policy, and stay within budget.
+<p align="center">
+  <em>Roll out AI with confidence across your organisation.</em>
+</p>
+
+<p align="center">
+  <a href="https://github.com/soth-ai/soth/actions/workflows/ci.yml">
+    <img src="https://github.com/soth-ai/soth/actions/workflows/ci.yml/badge.svg" alt="CI" />
+  </a>
+  <a href="https://www.mozilla.org/en-US/MPL/2.0/">
+    <img src="https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg" alt="License: MPL 2.0" />
+  </a>
+  <a href="https://www.rust-lang.org">
+    <img src="https://img.shields.io/badge/rust-1.75%2B-orange.svg" alt="Rust 1.75+" />
+  </a>
+  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg" alt="Platform: macOS | Linux | Windows" />
+</p>
+
+<p align="center">
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#standalone-self-hosted">Self-hosted</a> ·
+  <a href="#open-source-vs-soth-cloud">OSS vs Cloud</a> ·
+  <a href="#configuration">Configuration</a> ·
+  <a href="#architecture">Architecture</a> ·
+  <a href="#documentation">Docs</a> ·
+  <a href="#contributing">Contributing</a>
+</p>
 
 ---
 
+Soth sits between your AI agents and the rest of the world — capturing, classifying, and
+governing MCP, HTTP, and AI-provider traffic. Connect your nodes to **[SOTH Cloud](https://dashboard.soth.ai)**
+for a managed dashboard with live feeds, policy, and budget across your whole fleet — or
+run the proxy fully standalone and headless. Either way: see what your agents are doing,
+enforce policy, and stay within budget.
+
 ## What it does
 
-- **MITM proxy** — selective TLS termination of AI provider domains (OpenAI, Anthropic,
-  Google, etc.); transparent tunnel for everything else. Always-on without breaking
+- **MITM proxy** — selective TLS termination of AI-provider domains (OpenAI, Anthropic,
+  Google, …); transparent tunnel for everything else. Always-on without breaking
   unrelated traffic.
 - **Policy & budget** — OPA-style rules to block, allow, or rate-limit by agent,
   model, endpoint, or cost.
-- **Local-first observability** — events stream to a SQLite store. Nothing leaves
-  the machine unless you enable cloud sync.
+- **Fleet observability** — every event is captured locally (SQLite) and, with SOTH
+  Cloud, streams to a managed dashboard with live feeds, policy and budget views, and
+  multi-node management. No UI to build or host yourself.
 
-## Install
+## Quick start
 
-**macOS / Linux**
+Two ways to run Soth. Most teams start with **SOTH Cloud** — a managed backend and
+dashboard, so there's no UI to build or host. The proxy is identical either way.
+
+### SOTH Cloud (recommended)
+
+1. Sign in at **[dashboard.soth.ai](https://dashboard.soth.ai)** and create an
+   enrollment link for your team.
+2. Run the one-liner it gives you on each machine:
 
 ```bash
+curl -fsSL "https://dashboard.soth.ai/install?enroll_token=<token>" | bash -s --
+```
+
+This downloads the signature-verified proxy binary, enrolls the node with the backend,
+and starts capturing. Live traffic, policy, and budget show up in your dashboard right
+away — across every enrolled machine.
+
+> Prefer an API key to a per-node token?
+> `curl -fsSL "https://dashboard.soth.ai/install" | bash -s -- --api-key <key>`
+
+### Standalone (self-hosted)
+
+Soth also runs fully standalone — no account, no cloud, nothing leaves the machine.
+Install the headless binary and drive it from the CLI:
+
+```bash
+# macOS / Linux
 curl -fsSL https://soth.ai/install.sh | bash
+# Windows (PowerShell 7.5+):  iwr -useb https://soth.ai/install.ps1 | iex
+
+soth setup-ca        # one-time local MITM CA
+soth start           # start the proxy
+soth on              # route system traffic through it
+soth events stream   # headless live feed (no GUI)
 ```
 
-**Windows (PowerShell 7.5+)**
-
-```powershell
-iwr -useb https://soth.ai/install.ps1 | iex
-```
-
-Or build from source:
+The standalone proxy is **headless** — inspect traffic with `soth events stream` or query
+the SQLite store at `~/.soth/` directly. Build from source:
 
 ```bash
 git clone https://github.com/soth-ai/soth
-cd soth
-cargo build --release
+cd soth && cargo build --release
 ./target/release/soth --version
 ```
 
-## Quickstart (60 seconds)
+## Open source vs SOTH Cloud
 
-```bash
-# 1. Generate a local MITM CA (one-time)
-soth setup-ca
+| | Open source (this repo) | SOTH Cloud |
+|---|---|---|
+| Edge proxy, MCP / HTTP capture | ✅ | ✅ |
+| Policy engine, budget, classification | ✅ | ✅ |
+| Local SQLite store + `soth events stream` | ✅ | ✅ |
+| Visual dashboard & live feeds | — | ✅ |
+| Multi-node fleet management | — | ✅ |
+| Managed policy / budget across teams | — | ✅ |
 
-# 2. Start the proxy
-soth start
-
-# 3. Route system traffic through it
-soth on
-
-# 4. Open any AI app or browse api.openai.com — then watch the feed
-soth events stream
-```
+The proxy is fully functional standalone. SOTH Cloud is a managed backend + dashboard on
+top — there's no UI to build or host yourself.
 
 ## Configuration
 
@@ -72,10 +130,7 @@ Copy `soth.example.yaml` to `~/.soth/soth.yaml` and edit. Key sections:
 | `observe` | Local logging, PII redaction, retention |
 | `budget` | Per-agent token & cost limits |
 | `forward_proxy` | MITM listener, intercept domain list, CA paths |
-
-See [`docs/INSTALL.md`](docs/INSTALL.md) for installation internals and
-[`docs/PRODUCTION_READINESS.md`](docs/PRODUCTION_READINESS.md) for operational
-guidance.
+| `cloud` | SOTH Cloud endpoints & enrollment credentials |
 
 ## Architecture
 
@@ -93,11 +148,15 @@ agents │  AI clients  │
        └──────┬───────┘         └─────────────────┘
               │ events
               ▼
-       ┌──────────────┐         ┌─────────────────┐
-       │ SQLite store │ ──────► │ optional cloud  │
-       │  (events)    │         │ sync (opt-in)   │
-       └──────────────┘         └─────────────────┘
+       ┌──────────────┐         ┌─────────────────────┐
+       │ SQLite store │ ──────► │     SOTH Cloud      │
+       │  (local)     │         │ dashboard · policy  │
+       └──────────────┘         │ budget · fleet      │
+                                └─────────────────────┘
 ```
+
+Cloud sync is what powers the dashboard; the local SQLite store always works on its own,
+so the proxy runs fully standalone if you skip enrollment.
 
 Core crates:
 
@@ -107,22 +166,33 @@ Core crates:
 - `soth-classify` — 7-stage classification pipeline with optional ONNX models
 - `soth-detect` — deterministic detection helpers
 - `soth-telemetry` — local SQLite storage
-- `soth-extensions` — extension manager (with `historian` and `code` ext bundled)
+- `soth-sync` — cloud enrollment and event sync
+- `soth-extensions` — extension manager (bundles `historian` and `code`)
+
+## Documentation
+
+| Guide | What's inside |
+|---|---|
+| [Installation internals](docs/INSTALL.md) | Installer mechanics, paths, self-update |
+| [Production readiness](docs/PRODUCTION_READINESS.md) | Operational guidance & known gaps |
+| [Configuration reference](soth.example.yaml) | Every config key, annotated |
+| [Contributing](CONTRIBUTING.md) | Dev setup and the PR workflow |
+| [Security policy](SECURITY.md) | Reporting vulnerabilities |
+| [Changelog](CHANGELOG.md) | What's shipped |
 
 ## Status
 
-Soth is **alpha**. The proxy, wrap, and policy engine work today and are used in
-production by the maintainers, but APIs may change before 1.0. See
-[CHANGELOG.md](CHANGELOG.md) for what's shipped.
+Soth is **alpha**. The proxy and policy engine work today and are used in production by
+the maintainers, but APIs may change before 1.0. See [CHANGELOG.md](CHANGELOG.md) for
+what's shipped.
 
 ## Contributing
 
-Bug reports, fixes, and ideas welcome. See [CONTRIBUTING.md](CONTRIBUTING.md)
-for setup and the PR workflow. Security issues: [SECURITY.md](SECURITY.md).
+Bug reports, fixes, and ideas welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup
+and the PR workflow. Security issues: [SECURITY.md](SECURITY.md).
 
 ## License
 
-Soth is distributed under the **Mozilla Public License 2.0** —
-see [LICENSE](LICENSE). Modifications to MPL-covered files must be
-shared under the same license; everything else (downstream applications,
-larger works that link to Soth) can be licensed however you like.
+Soth is distributed under the **Mozilla Public License 2.0** — see [LICENSE](LICENSE).
+Modifications to MPL-covered files must be shared under the same license; everything else
+(downstream applications, larger works that link to Soth) can be licensed however you like.
