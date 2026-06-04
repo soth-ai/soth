@@ -46,7 +46,7 @@ In scope:
 - The `soth` CLI and binaries it produces.
 - All crates in this repository.
 - The MITM CA generation and trust flow.
-- The local ops/dashboard HTTP server.
+- The local ops HTTP server.
 
 Out of scope (please report to the relevant project):
 

@@ -5,8 +5,8 @@
 //! environment variables so the proxy runs cleanly without them (tests,
 //! offline dev, distros that haven't been configured yet).
 //!
-//! See `docs/common/observability.md` for the full design and the redaction
-//! policy this module enforces.
+//! The `redaction` submodule documents the redaction policy this module
+//! enforces before any span or event leaves the process.
 
 pub mod honeycomb;
 pub mod redaction;

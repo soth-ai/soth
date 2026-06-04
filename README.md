@@ -17,13 +17,10 @@ doing, enforce policy, and stay within budget.
 - **MITM proxy** — selective TLS termination of AI provider domains (OpenAI, Anthropic,
   Google, etc.); transparent tunnel for everything else. Always-on without breaking
   unrelated traffic.
-- **MCP wrap** — wraps any MCP server (`soth wrap -- <cmd>`) to capture stdio
-  JSON-RPC traffic from Claude Desktop, Cursor, Windsurf, and other clients.
 - **Policy & budget** — OPA-style rules to block, allow, or rate-limit by agent,
   model, endpoint, or cost.
-- **Local-first observability** — events stream to a SQLite store and a local
-  dashboard at `http://127.0.0.1:3002`. Nothing leaves the machine unless you
-  enable cloud sync.
+- **Local-first observability** — events stream to a SQLite store. Nothing leaves
+  the machine unless you enable cloud sync.
 
 ## Install
 
@@ -52,26 +49,17 @@ cargo build --release
 
 ```bash
 # 1. Generate a local MITM CA (one-time)
-soth proxy setup-ca
+soth setup-ca
 
 # 2. Start the proxy
 soth start
 
 # 3. Route system traffic through it
-soth proxy on
+soth on
 
 # 4. Open any AI app or browse api.openai.com — then watch the feed
-soth tail
+soth events stream
 ```
-
-Or wrap an MCP server directly:
-
-```bash
-soth wrap -- npx -y @modelcontextprotocol/server-filesystem /tmp
-```
-
-A local dashboard is available at **http://127.0.0.1:3002** (enable via
-`dashboard.enabled: true` in `soth.yaml`).
 
 ## Configuration
 
@@ -84,7 +72,6 @@ Copy `soth.example.yaml` to `~/.soth/soth.yaml` and edit. Key sections:
 | `observe` | Local logging, PII redaction, retention |
 | `budget` | Per-agent token & cost limits |
 | `forward_proxy` | MITM listener, intercept domain list, CA paths |
-| `dashboard` | Local UI listener (default `127.0.0.1:3001`) |
 
 See [`docs/INSTALL.md`](docs/INSTALL.md) for installation internals and
 [`docs/PRODUCTION_READINESS.md`](docs/PRODUCTION_READINESS.md) for operational
@@ -107,8 +94,8 @@ agents │  AI clients  │
               │ events
               ▼
        ┌──────────────┐         ┌─────────────────┐
-       │  SQLite +    │ ──────► │ optional cloud  │
-       │  dashboard   │         │ sync (opt-in)   │
+       │ SQLite store │ ──────► │ optional cloud  │
+       │  (events)    │         │ sync (opt-in)   │
        └──────────────┘         └─────────────────┘
 ```
 

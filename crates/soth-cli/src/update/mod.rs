@@ -7,9 +7,6 @@
 //! - [`download_binary`] — sha256-checked staged download
 //! - [`Swapper`] / [`make_swapper`] — atomic per-OS swap dispatch
 //! - [`UpdateCache`] — `~/.soth/run/update_cache.json` reader/writer
-//!
-//! Plan reference: docs/common/2026-05-11/hot-update-0.1.1-impl-plan.md §3.3-3.4
-//! Schema reference: docs/common/2026-05-09/hot-update-plan.md §2.1
 
 pub mod cache;
 pub mod download;

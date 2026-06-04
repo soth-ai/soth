@@ -183,6 +183,4 @@ with that exact string).
 
 ## Related docs
 
-- Architecture: [`docs/common/2026-05-09/hot-update-plan.md`](common/2026-05-09/hot-update-plan.md) (parent plan)
-- Phase-by-phase implementation: `../../docs/common/2026-05-11/hot-update-0.1.1-impl-plan.md` (workspace-level)
 - Signing keys: [`ops/keys/README.md`](../ops/keys/README.md)

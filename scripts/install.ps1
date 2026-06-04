@@ -1,4 +1,4 @@
-# SOTH installer for Windows (BETA, ships with 0.2.0+)
+# SOTH installer for Windows (BETA, ships with 0.1.1+)
 #
 # Usage (from PowerShell):
 #   iwr -useb https://soth.ai/install.ps1 | iex
