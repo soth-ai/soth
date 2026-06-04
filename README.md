@@ -13,7 +13,7 @@
 </p>
 
 <p align="center">
-  <em>Know your agents. Control what they do.</em>
+  <em>Roll out AI with confidence across your organisation.</em>
 </p>
 
 <p align="center">
