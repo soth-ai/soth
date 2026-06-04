@@ -9,7 +9,7 @@
 <h1 align="center">SOTH</h1>
 
 <p align="center">
-  <strong>An edge proxy and observability platform for AI agent traffic.</strong>
+  <strong>An edge governance and observability platform for AI agent traffic.</strong>
 </p>
 
 <p align="center">
