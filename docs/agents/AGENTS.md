@@ -3,28 +3,33 @@
 Operational guide for Codex instances working in this repository.
 
 ## Scope
-SOTH is an edge sensor for AI traffic with three capture paths:
+SOTH is an edge sensor for AI traffic with these capture paths:
 
-- `soth start` / `soth up`: HTTP/HTTPS + WebSocket proxy capture.
-- `soth wrap`: MCP stdio capture by wrapping MCP server processes.
-- collector pipeline (config-driven): local session artifact ingestion.
+- `soth start` / `soth up`: HTTP/HTTPS + WebSocket proxy capture (selective MITM).
+- `soth code` (hook): synchronous policy gate + capture at the AI coding agent's
+  hook boundary (Claude Code, Cursor, Codex).
+- `historian` extension: local AI-tool history ingestion, playbook/config-driven.
 
 Policy, budget, identity/crypto, and observability apply across all paths and normalize into Exchange V2 records.
 
 ## Workspace Map
-- `crates/soth-cli`: CLI surface and runtime lifecycle (`start/up/down/stop/logs/on/off`, `wrap`, `runtime`, `dev`).
+- `crates/soth-cli`: CLI surface and runtime lifecycle (`start/up/down/stop/logs/on/off`, `status`, `doctor`, `init`, `enroll`, `login`, `setup-ca`, `env`, `events`, `bundle`, `config`, `code`, `update`).
+- `crates/soth-cli-update-sidecar`: Windows sidecar updater (atomic self-update swap).
 - `crates/soth-proxy`: MITM transport + bundle-driven gating/classification + exchange assembly.
-- `crates/soth-sync`: cloud sync, exchange upload queue, registry bundle cache refresh.
+- `crates/soth-core`: canonical shared contracts and primitives, including `crypto.rs` (keys, signatures, TLS helpers) and `identity.rs`.
+- `crates/soth-api-types`: cloud API wire contract shared between proxy (soth-sync) and SDK (soth-sdk-core).
+- `crates/soth-sync`: edge-side cloud sync, exchange upload queue, registry bundle cache refresh.
 - `crates/soth-telemetry`: local SQLite telemetry storage and query helpers.
-- `crates/soth-collector`: local session collectors and incremental scans.
-- `crates/soth-wrap`: MCP stdio runtime path (planned near-term expansion).
-- `crates/soth-core`: shared config, event/exchange schemas, sqlite logger/storage primitives.
-- `crates/soth-crypto`: key management, signatures, TLS helpers.
-- `crates/soth-bundle`: bundle loader/cache/watcher for classify/policy/detect artifacts.
+- `crates/soth-bundle`: verified intelligence bundle loading, validation, and hot-swap for classify/policy/detect artifacts.
 - `crates/soth-classify`: 7-stage classification pipeline and anomaly scoring.
 - `crates/soth-detect`: deterministic detection helpers and host/domain attribution.
-- `crates/soth-policy`: policy engine/wrappers.
-- `crates/soth-sqlite-vec`: sqlite-vec lifecycle/loading adapter.
+- `crates/soth-parse`: format fingerprinting and request/response body parsing for AI API traffic.
+- `crates/soth-policy`: synchronous policy bundle evaluation.
+- `crates/soth-sdk-core`: public-API facade consumed by the SDK bindings (PyO3 / napi-rs / WASM).
+- `crates/soth-conformance-tests`: cross-lane parity harness for soth-detect + soth-classify (proxy vs SDK).
+- `extensions/code` (`soth-code`): coding-agent hook capture extension.
+- `extensions/historian` (`soth-historian`): AI-tool history ingestion extension.
+- `bindings/soth-py`, `bindings/soth-node`, `bindings/soth-edge`: Python (PyO3), Node.js (napi-rs), and edge/WASM SDK bindings.
 
 ## Canonical Host Classes
 Bundle classification splits traffic into:
@@ -37,7 +42,7 @@ Host lists can still be configured under `forward_proxy.hosts`, but runtime inte
 
 ## Detection Model
 - Proxy: edge registry bundle rules are primary.
-- Wrap: precedence is `--agent` override, MCP `initialize.clientInfo`, env/process hints, then unknown.
+- Coding-agent / MCP capture: precedence is `--agent` override, MCP `initialize.clientInfo`, env/process hints, then unknown.
 - Events carry detection metadata (`detection_id`, `detection_reason`, `parse_confidence`, `detection_source`).
 
 ## Event Encoding
@@ -63,7 +68,7 @@ Host lists can still be configured under `forward_proxy.hosts`, but runtime inte
   - `curl --noproxy '*' --http2 https://api.tbox.cn/` negotiates `ALPN: http/1.1` (upstream does not support h2)
   - TLS gate trace still shows `tls_intercept_catalog`, but no HTTP gate event is emitted on failed HTTP/2 requests.
   Root cause:
-  - In `soth-mitm` (`mitm-sidecar/src/flow_intercept.rs`), when downstream negotiates h2 but upstream negotiates non-h2, the flow exits with `MitmHttpError` instead of protocol downgrading.
+  - In the proxy MITM transport (`crates/soth-proxy/src/handler.rs`), when downstream negotiates h2 but upstream negotiates non-h2, the flow can fail instead of protocol downgrading.
   Current guidance:
   - For gating corpus/debug traffic, force HTTP/1.1 for h2-incompatible hosts to avoid transport false negatives.
   - Fix direction: add host-level `disable_h2` override (or h2->h1 downgrade path) so downstream ALPN does not advertise/commit h2 for those hosts.

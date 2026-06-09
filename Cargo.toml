@@ -129,7 +129,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Observability — phase 1: edge proxy → Honeycomb (OTLP/HTTP) + Sentry for
-# panics + ERROR-level events. See docs/common/observability.md.
+# panics + ERROR-level events.
 opentelemetry = "0.27"
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.27", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace"] }

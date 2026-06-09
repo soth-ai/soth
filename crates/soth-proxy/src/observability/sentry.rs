@@ -1,7 +1,7 @@
 //! Sentry integration: panic capture + ERROR-level event capture.
 //!
-//! Sentry is a complement to OpenTelemetry, not a replacement. Per
-//! `docs/common/observability.md`, we route ALL tracing spans through
+//! Sentry is a complement to OpenTelemetry, not a replacement. We route
+//! ALL tracing spans through
 //! `tracing-opentelemetry` (→ Honeycomb) for distributed-trace analysis,
 //! and only let Sentry see the panic + ERROR slice via `sentry::ClientOptions`
 //! `traces_sample_rate = 0.0` plus the `sentry-tracing` layer at filter

@@ -37,20 +37,6 @@ Thumbs.db
 logs/
 *.log
 
-# Node.js (dashboard)
-dashboard/node_modules/
-dashboard/.next/
-dashboard/out/
-dashboard/build/
-dashboard/dist/
-dashboard/.env
-dashboard/.env.local
-dashboard/*.tsbuildinfo
-dashboard/next-env.d.ts
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-
 # Test artifacts
 *.profraw
 coverage/
@@ -61,7 +47,6 @@ lcov.info
 *.pem
 *.crt
 *.key
-!tests/fixtures/**/*.pem
 
 # Temporary files
 *.tmp
