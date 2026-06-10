@@ -1,8 +1,8 @@
 # SOTH installer for Windows (BETA, ships with 0.1.1+)
 #
 # Usage (from PowerShell):
-#   iwr -useb https://soth.ai/install.ps1 | iex
-#   $env:SOTH_CHANNEL = 'canary'; iwr -useb https://soth.ai/install.ps1 | iex
+#   iwr -useb https://dashboard.soth.ai/install.ps1 | iex
+#   $env:SOTH_CHANNEL = 'canary'; iwr -useb https://dashboard.soth.ai/install.ps1 | iex
 #
 # Or, from a checkout of the source repo:
 #   powershell.exe -ExecutionPolicy Bypass -File .\scripts\install.ps1
