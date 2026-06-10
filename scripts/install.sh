@@ -2,9 +2,9 @@
 # SOTH installer (BETA, ships with 0.1.1+)
 #
 # Usage:
-#   curl -fsSL https://soth.ai/install.sh | bash
-#   curl -fsSL https://soth.ai/install.sh | bash -s -- --channel canary
-#   curl -fsSL https://soth.ai/install.sh | bash -s -- --version 0.1.4
+#   curl -fsSL https://dashboard.soth.ai/install.sh | bash
+#   curl -fsSL https://dashboard.soth.ai/install.sh | bash -s -- --channel canary
+#   curl -fsSL https://dashboard.soth.ai/install.sh | bash -s -- --version 0.1.4
 #
 # Or, from a checkout of the source repo:
 #   ./scripts/install.sh

@@ -8,24 +8,24 @@ relies on these paths being stable. Treat changes here as breaking.
 
 ```bash
 # macOS / Linux
-curl -fsSL https://soth.ai/install.sh | bash
+curl -fsSL https://dashboard.soth.ai/install.sh | bash
 
 # Windows (PowerShell 7.5+)
-iwr -useb https://soth.ai/install.ps1 | iex
+iwr -useb https://dashboard.soth.ai/install.ps1 | iex
 ```
 
 Channel, version, and install-dir overrides:
 
 ```bash
 # Bash
-SOTH_CHANNEL=canary curl -fsSL https://soth.ai/install.sh | bash
-SOTH_VERSION=0.1.0 curl -fsSL https://soth.ai/install.sh | bash
-curl -fsSL https://soth.ai/install.sh | bash -s -- --install-dir /opt/soth/bin
-curl -fsSL https://soth.ai/install.sh | bash -s -- --version 0.1.0
+SOTH_CHANNEL=canary curl -fsSL https://dashboard.soth.ai/install.sh | bash
+SOTH_VERSION=0.1.0 curl -fsSL https://dashboard.soth.ai/install.sh | bash
+curl -fsSL https://dashboard.soth.ai/install.sh | bash -s -- --install-dir /opt/soth/bin
+curl -fsSL https://dashboard.soth.ai/install.sh | bash -s -- --version 0.1.0
 
 # PowerShell
-$env:SOTH_CHANNEL = 'canary'; iwr -useb https://soth.ai/install.ps1 | iex
-$env:SOTH_VERSION = '0.1.0'; iwr -useb https://soth.ai/install.ps1 | iex
+$env:SOTH_CHANNEL = 'canary'; iwr -useb https://dashboard.soth.ai/install.ps1 | iex
+$env:SOTH_VERSION = '0.1.0'; iwr -useb https://dashboard.soth.ai/install.ps1 | iex
 ```
 
 Both scripts:
