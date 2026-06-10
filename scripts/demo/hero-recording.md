@@ -5,6 +5,18 @@ of the README. The goal is a short, looping cast that shows Soth coming online
 and live-classifying AI traffic — the equivalent of a product screenshot for a
 tool that lives in the terminal.
 
+## Two reproducible tapes
+
+There are two [VHS](https://github.com/charmbracelet/vhs) tapes — both produce
+`.github/assets/hero.gif`:
+
+| Tape | What's real | Safe to run where |
+|------|-------------|-------------------|
+| `hero.tape` (default) | `events stream` is the real binary over a **seeded** store (`seed-feed.sh`); Scene 1 setup lines are replayed real strings (`hero-scene.sh`) | **Any machine** — non-invasive: isolated `HOME`, no system-proxy change, no network calls |
+| `hero-live.tape` | **Everything** — real CA trust, `start`, `on`, and live AI-provider requests (`gen-traffic.sh`) classified by the real proxy | **Throwaway VM / root box only** — installs system CA trust and rewrites the system proxy |
+
+Render: `vhs scripts/demo/hero.tape` (or `hero-live.tape`).
+
 > All on-screen output below uses Soth's **real** formats:
 > - quickstart commands from `crates/soth-cli/src/command_graph.rs`
 > - the compact event line from `render_compact_line()` in
