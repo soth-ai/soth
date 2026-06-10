@@ -810,8 +810,11 @@ cmd_github_release() {
   echo "==> GitHub release ${tag} on ${GH_REPO} (channel=${channel}, ${#assets[@]} assets)"
 
   if gh release view "$tag" --repo "$GH_REPO" >/dev/null 2>&1; then
-    # Release exists — clobber assets so re-runs are idempotent.
+    # Release exists — clobber assets so re-runs are idempotent, and reconcile
+    # the latest/prerelease flag (e.g. a prior canary prerelease being promoted
+    # to a stable latest on a later run).
     if gh release upload "$tag" --repo "$GH_REPO" --clobber "${assets[@]}"; then
+      gh release edit "$tag" --repo "$GH_REPO" $latest_flag >/dev/null 2>&1 || true
       echo "  updated existing release ${tag}"
     else
       echo "  WARN: gh release upload failed for ${tag}; artifacts remain on storage.soth.ai."
@@ -1117,8 +1120,12 @@ cmd_release_cli() {
     done
     CHANNEL="$saved_channel"
     # Mirror the signed artifacts to GitHub Releases once per version (not
-    # per channel). resolve_channel picks latest vs prerelease. Soft-fail.
-    cmd_github_release
+    # per channel). Only on prod — staging is internal RC testing and must not
+    # spam the public repo's releases. Mirror an internal env explicitly with
+    # `make github-release ENV=staging GH_REPO=<internal>`. Soft-fail.
+    if [ "$ENV" = "prod" ]; then
+      cmd_github_release
+    fi
   fi
 }
 
