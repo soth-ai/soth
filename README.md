@@ -31,7 +31,8 @@
 
 <p align="center">
   <a href="#quick-start">Quick start</a> ·
-  <a href="#standalone-self-hosted">Self-hosted</a> ·
+  <a href="#verify-before-you-run">Verify</a> ·
+  <a href="#why-trust-a-mitm-proxy">Trust</a> ·
   <a href="#open-source-vs-soth-cloud">OSS vs Cloud</a> ·
   <a href="#configuration">Configuration</a> ·
   <a href="#architecture">Architecture</a> ·
@@ -39,13 +40,20 @@
   <a href="#contributing">Contributing</a>
 </p>
 
+<p align="center">
+  <img src=".github/assets/hero.gif" alt="Soth coming online and live-classifying AI agent traffic in the terminal" width="900" />
+</p>
+
 ---
 
 Soth sits between your AI agents and the rest of the world — capturing, classifying, and
-governing MCP, HTTP, and AI-provider traffic. Connect your nodes to **[SOTH Cloud](https://dashboard.soth.ai)**
-for a managed dashboard with live feeds, policy, and budget across your whole fleet — or
-run the proxy fully standalone and headless. Either way: see what your agents are doing,
-enforce policy, and stay within budget.
+governing MCP, HTTP, and AI-provider traffic. It runs **fully standalone and headless**:
+no account, no cloud, nothing leaves the machine. See what your agents are doing, enforce
+policy, and stay within budget — all from the local SQLite store and the CLI.
+
+When you want a visual dashboard, live feeds, and policy/budget across a whole fleet,
+connect your nodes to the optional managed backend, **[SOTH Cloud](https://dashboard.soth.ai)**.
+The proxy is identical either way.
 
 ## What it does
 
@@ -60,29 +68,7 @@ enforce policy, and stay within budget.
 
 ## Quick start
 
-Two ways to run Soth. Most teams start with **SOTH Cloud** — a managed backend and
-dashboard, so there's no UI to build or host. The proxy is identical either way.
-
-### SOTH Cloud (recommended)
-
-1. Sign in at **[dashboard.soth.ai](https://dashboard.soth.ai)** and create an
-   enrollment link for your team.
-2. Run the one-liner it gives you on each machine:
-
-```bash
-curl -fsSL "https://dashboard.soth.ai/install?enroll_token=<token>" | bash -s --
-```
-
-This downloads the signature-verified proxy binary, enrolls the node with the backend,
-and starts capturing. Live traffic, policy, and budget show up in your dashboard right
-away — across every enrolled machine.
-
-> Prefer an API key to a per-node token?
-> `curl -fsSL "https://dashboard.soth.ai/install" | bash -s -- --api-key <key>`
-
-### Standalone (self-hosted)
-
-Soth also runs fully standalone — no account, no cloud, nothing leaves the machine.
+Soth runs fully standalone by default — no account, no cloud, nothing leaves the machine.
 Install the headless binary and drive it from the CLI:
 
 ```bash
@@ -96,14 +82,83 @@ soth on              # route system traffic through it
 soth events stream   # headless live feed (no GUI)
 ```
 
-The standalone proxy is **headless** — inspect traffic with `soth events stream` or query
-the SQLite store at `~/.soth/` directly. Build from source:
+Inspect traffic with `soth events stream` or query the SQLite store at `~/.soth/`
+directly. Prefer to pipe nothing into your shell? See
+[Verify before you run](#verify-before-you-run) and
+[Why trust a MITM proxy?](#why-trust-a-mitm-proxy) below.
+
+Build from source instead:
 
 ```bash
 git clone https://github.com/soth-ai/soth
 cd soth && cargo build --release
 ./target/release/soth --version
 ```
+
+### Optional: connect to SOTH Cloud
+
+Want a managed dashboard, live feeds, and policy/budget across a fleet? Enroll your
+nodes against the managed backend instead of installing standalone:
+
+1. Sign in at **[dashboard.soth.ai](https://dashboard.soth.ai)** and create an
+   enrollment link for your team.
+2. Run the one-liner it gives you on each machine:
+
+```bash
+curl -fsSL "https://dashboard.soth.ai/install?enroll_token=<token>" | bash -s --
+```
+
+This installs the same signature-verified binary, enrolls the node with the backend,
+and starts capturing. Live traffic, policy, and budget show up in your dashboard right
+away — across every enrolled machine.
+
+> Prefer an API key to a per-node token?
+> `curl -fsSL "https://dashboard.soth.ai/install" | bash -s -- --api-key <key>`
+
+## Verify before you run
+
+Piping a script into your shell is convenient but opaque. If you'd rather read it first,
+download, inspect, and run it as separate steps:
+
+```bash
+# macOS / Linux
+curl -fsSL https://dashboard.soth.ai/install.sh -o soth-install.sh
+less soth-install.sh        # read exactly what it does before running
+bash soth-install.sh
+```
+
+You don't have to take the script's word for what it installs. The installer itself
+performs a verifiable trust handshake before anything lands on disk:
+
+1. Fetches a release **manifest** over HTTPS.
+2. **ed25519-verifies** the manifest against a public key embedded in the script
+   (mirrors [`ops/keys/`](ops/keys/)) — a compromised storage bucket alone cannot push a
+   malicious binary.
+3. Downloads the platform binary and **verifies its sha256** against the manifest before
+   installing ([`scripts/install.sh`](scripts/install.sh)).
+
+So the only thing you're trusting at `curl` time is the script you just read — and it, in
+turn, refuses to install anything that isn't operator-signed.
+
+## Why trust a MITM proxy?
+
+Soth asks for real privileges — it installs a local CA and terminates TLS for AI-provider
+domains. That's a lot to ask, so the design is built to be auditable rather than taken on
+faith:
+
+- **The CA is local and scoped.** `soth setup-ca` generates a CA that lives only on your
+  machine and is used solely to intercept the AI-provider domains you configure;
+  everything else is tunnelled untouched. Read the code:
+  [`commands/proxy/setup_ca.rs`](crates/soth-cli/src/commands/proxy/setup_ca.rs).
+- **Selective interception, not blanket MITM.** Only AI domains are TLS-terminated;
+  all other traffic is a blind passthrough (see the architecture diagram below).
+- **You can see exactly what's recorded.** The event/telemetry schema is open:
+  [`soth-core/src/telemetry.rs`](crates/soth-core/src/telemetry.rs) and
+  [`soth-api-types/src/api_types.rs`](crates/soth-api-types/src/api_types.rs). PII
+  redaction is configurable under `observe`.
+- **Standalone means nothing leaves the machine.** With no cloud enrollment, every event
+  stays in the local SQLite store at `~/.soth/`. Sync to SOTH Cloud is opt-in and only
+  happens after you enroll.
 
 ## Open source vs SOTH Cloud
 
