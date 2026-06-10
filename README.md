@@ -197,11 +197,14 @@ agents │  AI clients  │
        └──────┬───────┘
               │ HTTP(S) / stdio / WebSocket
               ▼
-       ┌──────────────┐         ┌─────────────────┐
-       │     soth     │ ──────► │  AI providers   │
-       │  edge proxy  │         │ (api.openai...) │
-       └──────┬───────┘         └─────────────────┘
-              │ events
+       ┌──────────────┐  intercept  ┌─────────────────┐
+       │     soth     │ ──────────► │  AI providers   │  TLS terminated,
+       │  edge proxy  │             │ (api.openai...) │  inspected & governed
+       │              │             └─────────────────┘
+       │              │  tunnel     ┌─────────────────┐
+       │              │ ──────────► │  everything     │  blind passthrough,
+       └──────┬───────┘             │  else           │  never decrypted
+              │ events              └─────────────────┘
               ▼
        ┌──────────────┐         ┌─────────────────────┐
        │ SQLite store │ ──────► │     SOTH Cloud      │
