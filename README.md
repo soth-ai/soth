@@ -87,8 +87,8 @@ Install the headless binary and drive it from the CLI:
 
 ```bash
 # macOS / Linux
-curl -fsSL https://soth.ai/install.sh | bash
-# Windows (PowerShell 7.5+):  iwr -useb https://soth.ai/install.ps1 | iex
+curl -fsSL https://dashboard.soth.ai/install.sh | bash
+# Windows (PowerShell 7.5+):  iwr -useb https://dashboard.soth.ai/install.ps1 | iex
 
 soth setup-ca        # one-time local MITM CA
 soth start           # start the proxy
