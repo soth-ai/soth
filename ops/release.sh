@@ -65,6 +65,8 @@ ENV="${2:-staging}"
 : "${MIN_SUPPORTED_VERSION:=0.1.0}"
 # Where release notes live. Manifest stores the URL; clients open it.
 : "${RELEASE_NOTES_URL_TEMPLATE:=https://github.com/soth-ai/soth/releases/tag/v%VERSION%}"
+# GitHub repo that mirrors signed release artifacts via `github-release`.
+: "${GH_REPO:=soth-ai/soth}"
 
 PROD_BASE_URL="https://storage.soth.ai/release"
 STAGING_BASE_URL="https://storage.staging.soth.xyz/release"
@@ -149,6 +151,8 @@ cmd_help() {
 	  publish-manifest       Upload manifest.json + .sig to ENV's storage URL
 	  verify-manifest        Round-trip: re-fetch, re-verify against ops/keys/<key>.public.pem
 	  register-release       POST manifest metadata to ADMIN_API/v1/admin/cli/releases
+	  github-release         Mirror dist/ binaries + SHA256SUMS + signed manifest to
+	                         GitHub Releases on tag v<version> (GH_REPO=${GH_REPO})
 
 	Classify bundle (Phase 2):
 	  build-classify         tar -czf ${DIST_DIR}/classify-\$VERSION.tar.gz from \$DATA_DIR/classify/
@@ -738,6 +742,97 @@ PYEOF
   fi
 }
 
+# Mirror the signed release artifacts to GitHub Releases.
+#
+# Devs expect to find signed binaries + checksums attached to a GitHub Release
+# (it's also what `cargo binstall` and a future Homebrew formula key off of).
+# Today binaries live only on storage.soth.ai; this attaches the SAME bytes,
+# their .sha256 sidecars, a combined SHA256SUMS, and the signed channel
+# manifest (.json + .sig) to a release on the version tag.
+#
+# Reads from $DIST_DIR (the binaries built by build-cli + the manifest produced
+# by generate-manifest/sign-manifest). The tag is v<workspace-version>. stable
+# is published as `--latest`; canary as `--prerelease`. Soft-fails (like
+# register-release) so a missing/unauth gh never breaks the publish pipeline.
+cmd_github_release() {
+  case "$ENV" in
+    local)
+      echo "==> ENV=local: skipping GitHub release mirror."
+      return 0
+      ;;
+    staging | prod) ;;
+    *) err "ENV must be local|staging|prod (got '$ENV')" ;;
+  esac
+
+  if ! command -v gh >/dev/null 2>&1; then
+    echo "==> WARN: gh CLI not found; skipping GitHub release mirror."
+    echo "         Install + auth gh, then: GH_REPO=${GH_REPO} make github-release"
+    return 0
+  fi
+
+  local version tag channel
+  version=$(extract_workspace_version)
+  tag="v${version}"
+  channel=$(resolve_channel)
+
+  # Collect the platform binaries (skip .sha256 sidecars in the glob).
+  local assets=()
+  local f
+  for f in "$DIST_DIR"/soth-*; do
+    case "$f" in
+      *.sha256) ;;                       # added below alongside SHA256SUMS
+      *) [ -f "$f" ] && assets+=("$f") ;;
+    esac
+  done
+  if [ "${#assets[@]}" -eq 0 ]; then
+    echo "==> WARN: no soth-* binaries in ${DIST_DIR}; run build-cli first. Skipping."
+    return 0
+  fi
+
+  # Combined SHA256SUMS over the binaries (verifiable with `shasum -a 256 -c`).
+  local sums="${DIST_DIR}/SHA256SUMS"
+  ( cd "$DIST_DIR" && shasum -a 256 soth-* 2>/dev/null | grep -v '\.sha256$' > SHA256SUMS ) || true
+  [ -s "$sums" ] && assets+=("$sums")
+  # Per-binary .sha256 sidecars, if build-cli produced them.
+  for f in "$DIST_DIR"/soth-*.sha256; do
+    [ -f "$f" ] && assets+=("$f")
+  done
+
+  # Signed channel manifest + signature, if present.
+  local manifest="${DIST_DIR}/manifest/${channel}.json"
+  [ -f "$manifest" ] && assets+=("$manifest")
+  [ -f "${manifest}.sig" ] && assets+=("${manifest}.sig")
+
+  local notes_url="${RELEASE_NOTES_URL_TEMPLATE/\%VERSION\%/$version}"
+  local latest_flag="--latest"
+  [ "$channel" = "stable" ] || latest_flag="--prerelease"
+
+  echo "==> GitHub release ${tag} on ${GH_REPO} (channel=${channel}, ${#assets[@]} assets)"
+
+  if gh release view "$tag" --repo "$GH_REPO" >/dev/null 2>&1; then
+    # Release exists — clobber assets so re-runs are idempotent, and reconcile
+    # the latest/prerelease flag (e.g. a prior canary prerelease being promoted
+    # to a stable latest on a later run).
+    if gh release upload "$tag" --repo "$GH_REPO" --clobber "${assets[@]}"; then
+      gh release edit "$tag" --repo "$GH_REPO" $latest_flag >/dev/null 2>&1 || true
+      echo "  updated existing release ${tag}"
+    else
+      echo "  WARN: gh release upload failed for ${tag}; artifacts remain on storage.soth.ai."
+    fi
+  else
+    if gh release create "$tag" \
+        --repo "$GH_REPO" \
+        --title "$tag" \
+        --notes "Signed release artifacts for ${tag}. Binaries mirror storage.soth.ai/release/${tag}/; verify with the attached SHA256SUMS and the ed25519-signed ${channel}.json manifest. Install: https://dashboard.soth.ai/install.sh" \
+        $latest_flag \
+        "${assets[@]}"; then
+      echo "  created release ${tag}: $notes_url"
+    else
+      echo "  WARN: gh release create failed for ${tag}; artifacts remain on storage.soth.ai."
+    fi
+  fi
+}
+
 # Round-trip verify: download the freshly-published manifest, verify the
 # sig with the committed public key, ensure version + sha entries match
 # what we just uploaded. Belt-and-braces — same idea as cmd_verify_against
@@ -1024,6 +1119,13 @@ cmd_release_cli() {
       cmd_register_release
     done
     CHANNEL="$saved_channel"
+    # Mirror the signed artifacts to GitHub Releases once per version (not
+    # per channel). Only on prod — staging is internal RC testing and must not
+    # spam the public repo's releases. Mirror an internal env explicitly with
+    # `make github-release ENV=staging GH_REPO=<internal>`. Soft-fail.
+    if [ "$ENV" = "prod" ]; then
+      cmd_github_release
+    fi
   fi
 }
 
@@ -1402,6 +1504,7 @@ case "$VERB" in
   publish-manifest)  cmd_publish_manifest ;;
   verify-manifest)   cmd_verify_manifest ;;
   register-release)  cmd_register_release ;;
+  github-release)    cmd_github_release ;;
   build-classify)    cmd_build_classify ;;
   publish-classify)  cmd_publish_classify ;;
   release-classify)  cmd_release_classify ;;
