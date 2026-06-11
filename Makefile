@@ -45,7 +45,7 @@ verify-cli:
 diff:
 	$(OPS) diff '$(ENV)'
 
-.PHONY: generate-manifest sign-manifest publish-manifest verify-manifest register-release
+.PHONY: generate-manifest sign-manifest publish-manifest verify-manifest register-release github-release
 generate-manifest:
 	$(OPS) generate-manifest '$(ENV)'
 
@@ -60,6 +60,9 @@ verify-manifest:
 
 register-release:
 	$(OPS) register-release '$(ENV)'
+
+github-release:
+	$(OPS) github-release '$(ENV)'
 
 .PHONY: build-classify publish-classify release-classify verify-classify
 build-classify:
