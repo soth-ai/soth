@@ -61,6 +61,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_Networking_WinInet",
     "Win32_System_Threading",
 ] }
+ipconfig = "0.3"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["async_tokio"] }
