@@ -4406,6 +4406,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "uuid",
+ "windows-sys 0.59.0",
  "zeroize",
 ]
 

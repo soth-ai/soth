@@ -14,6 +14,7 @@
 pub mod classify_task;
 pub mod config;
 pub mod db;
+pub mod drain_signal;
 pub mod error;
 pub mod gating;
 pub mod runtime;

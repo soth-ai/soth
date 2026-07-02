@@ -2,7 +2,8 @@
 //!
 //! `run(registry)` drives the full proxy lifecycle: loads config, opens the DB,
 //! downloads classify models if needed, spins up MITM + ops + sync + telemetry,
-//! then waits for Ctrl+C or SIGUSR1 (graceful drain) and shuts everything down.
+//! then waits for Ctrl+C or a graceful-drain signal (SIGUSR1 on Unix, the
+//! named drain event on Windows — see `drain_signal`) and shuts everything down.
 //!
 //! Extension registration is the caller's responsibility: the `soth` CLI
 //! constructs an `ExtensionRegistry` (registering e.g. `HistorianExtension`)
@@ -338,24 +339,7 @@ async fn run_inner(ext_registry: Option<ExtensionRegistry>) -> Result<()> {
 
     info!("soth-proxy started; press Ctrl+C to stop");
 
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut usr1 = signal(SignalKind::user_defined1()).expect("listen for SIGUSR1");
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                info!("shutdown requested (Ctrl+C)");
-            }
-            _ = usr1.recv() => {
-                info!("graceful drain requested (SIGUSR1)");
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        tokio::signal::ctrl_c().await.context("wait for Ctrl+C")?;
-        info!("shutdown requested");
-    }
+    crate::drain_signal::wait_for_shutdown_signal().await;
     proxy_handle
         .shutdown(Duration::from_secs(30))
         .await
@@ -649,24 +633,7 @@ async fn run_inner() -> Result<()> {
 
     info!("soth-proxy started; press Ctrl+C to stop");
 
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut usr1 = signal(SignalKind::user_defined1()).expect("listen for SIGUSR1");
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                info!("shutdown requested (Ctrl+C)");
-            }
-            _ = usr1.recv() => {
-                info!("graceful drain requested (SIGUSR1)");
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        tokio::signal::ctrl_c().await.context("wait for Ctrl+C")?;
-        info!("shutdown requested");
-    }
+    crate::drain_signal::wait_for_shutdown_signal().await;
     proxy_handle
         .shutdown(Duration::from_secs(30))
         .await

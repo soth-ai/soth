@@ -981,7 +981,57 @@ async fn graceful_stop_child(child: &mut Child) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+/// Windows equivalent of the SIGUSR1 drain: sets the named kernel event the
+/// worker created at startup (`Local\soth-worker-drain-{pid}`, see
+/// `soth_proxy::drain_signal`), then waits up to 30 seconds for exit.
+/// Falls back to a hard kill if the event can't be opened (worker predates
+/// this protocol, or died) or the drain window elapses.
+#[cfg(windows)]
+async fn graceful_stop_child(child: &mut Child) -> Result<()> {
+    let signaled = child.id().map(signal_windows_drain_event).unwrap_or(false);
+    if !signaled {
+        warn!("could not signal drain event on old proxy child; falling back to hard kill");
+        return terminate_child(child).await;
+    }
+    match tokio::time::timeout(Duration::from_secs(30), child.wait()).await {
+        Ok(Ok(status)) => {
+            info!(status = %status, "old proxy child exited after drain");
+        }
+        Ok(Err(error)) => {
+            warn!(error = %error, "error waiting for old proxy child");
+        }
+        Err(_) => {
+            warn!("old proxy child did not exit within 30s drain window; killing");
+            let _ = terminate_child(child).await;
+        }
+    }
+    Ok(())
+}
+
+/// Open the worker's named drain event and set it. Returns `false` when the
+/// event doesn't exist or can't be signaled — callers fall back to a hard
+/// kill, matching the pre-drain behavior.
+#[cfg(windows)]
+fn signal_windows_drain_event(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenEventW, SetEvent, EVENT_MODIFY_STATE};
+
+    let name: Vec<u16> = soth_proxy::drain_signal::drain_event_name(pid)
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let handle = OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr());
+        if handle.is_null() {
+            return false;
+        }
+        let signaled = SetEvent(handle) != 0;
+        CloseHandle(handle);
+        signaled
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 async fn graceful_stop_child(child: &mut Child) -> Result<()> {
     terminate_child(child).await
 }
