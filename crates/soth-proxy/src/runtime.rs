@@ -337,6 +337,7 @@ async fn run_inner(ext_registry: Option<ExtensionRegistry>) -> Result<()> {
         None => proxy.start().await.context("start mitm proxy")?,
     };
 
+    crate::drain_signal::write_worker_ready_file();
     info!("soth-proxy started; press Ctrl+C to stop");
 
     crate::drain_signal::wait_for_shutdown_signal().await;
@@ -631,6 +632,7 @@ async fn run_inner() -> Result<()> {
         None => proxy.start().await.context("start mitm proxy")?,
     };
 
+    crate::drain_signal::write_worker_ready_file();
     info!("soth-proxy started; press Ctrl+C to stop");
 
     crate::drain_signal::wait_for_shutdown_signal().await;

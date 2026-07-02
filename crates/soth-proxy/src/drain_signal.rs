@@ -13,6 +13,41 @@
 
 use tracing::info;
 
+/// Env var carrying the supervisor-chosen path of the readiness file. The
+/// worker writes `{"pid": <u32>}` there once its listener is live; the
+/// supervisor waits for the file instead of TCP-probing the port.
+///
+/// The old probe (`TcpStream::connect(127.0.0.1:<port>)`) could not tell
+/// the new child's listener from the old child's during rotation — on Unix
+/// it didn't even prove the worker was up, since the supervisor itself
+/// holds the inherited listener and the kernel completes connects from the
+/// backlog. The ready-file is written by the worker process itself, so it
+/// is unambiguous.
+pub const WORKER_READY_FILE_ENV: &str = "SOTH_WORKER_READY_FILE";
+
+/// Write the readiness file if the supervisor requested one (best-effort:
+/// standalone/foreground runs have no supervisor and skip this). Written
+/// atomically via temp-file + rename so the supervisor never reads a
+/// partial file.
+pub(crate) fn write_worker_ready_file() {
+    let Ok(path) = std::env::var(WORKER_READY_FILE_ENV) else {
+        return;
+    };
+    let path = std::path::PathBuf::from(path);
+    let body = format!("{{\"pid\": {}}}\n", std::process::id());
+    let temp = path.with_extension("tmp");
+    let written =
+        std::fs::write(&temp, body.as_bytes()).and_then(|()| std::fs::rename(&temp, &path));
+    match written {
+        Ok(()) => info!(path = %path.display(), "worker readiness file written"),
+        Err(error) => tracing::warn!(
+            path = %path.display(),
+            %error,
+            "failed writing worker readiness file; supervisor will fall back to port probe"
+        ),
+    }
+}
+
 /// The name of the drain event for a worker process id. Kept in sync with
 /// the supervisor side (`soth-cli/src/commands/proxy/start.rs`).
 #[cfg(windows)]
@@ -80,8 +115,41 @@ pub(crate) async fn wait_for_shutdown_signal() {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ready_file_written_atomically_when_env_set() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("worker_ready_test.json");
+        // Env var is process-global; nothing else in this test binary reads
+        // it, and we clean up immediately after.
+        std::env::set_var(WORKER_READY_FILE_ENV, &path);
+        write_worker_ready_file();
+        std::env::remove_var(WORKER_READY_FILE_ENV);
+
+        let body = std::fs::read_to_string(&path).expect("ready file written");
+        assert!(body.contains(&format!("\"pid\": {}", std::process::id())));
+        assert!(
+            !path.with_extension("tmp").exists(),
+            "temp file must be renamed away"
+        );
+    }
+
+    #[test]
+    fn ready_file_skipped_without_env() {
+        // Must not panic or create anything when unsupervised.
+        std::env::remove_var(WORKER_READY_FILE_ENV);
+        write_worker_ready_file();
+    }
+}
+
 /// Create the named drain event and block until the supervisor sets it.
 /// Returns `true` when the event fired, `false` on any setup/wait failure.
+// unsafe_code is denied crate-wide; this function is one of the two FFI
+// exceptions (with sqlite_vec) — kernel event syscalls have no safe wrapper.
+#[allow(unsafe_code)]
 #[cfg(windows)]
 fn wait_for_drain_event(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
