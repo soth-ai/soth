@@ -170,10 +170,11 @@ pub async fn run(
     #[cfg(not(unix))]
     let listener_fd: Option<i32> = None;
 
-    let mut child = spawn_proxy_process(generated_path.as_path(), listener_fd)
+    let (mut child, ready_probe) = spawn_proxy_process(generated_path.as_path(), listener_fd)
         .await
         .context("spawn soth-proxy process")?;
-    wait_for_listener_start(&mut child, expected_port).await?;
+    wait_for_listener_start(&mut child, expected_port, &ready_probe).await?;
+    drop(ready_probe);
 
     // Historian sibling process. Spawned only when both `enabled` and
     // run_mode == Subprocess. Watched in its own background task so its
@@ -613,9 +614,42 @@ async fn spawn_classify_daemon_process(config_path: &Path) -> Result<Child> {
         .map_err(|error| anyhow::anyhow!("failed launching classify daemon worker: {error}"))
 }
 
-async fn spawn_proxy_process(config_path: &Path, listener_fd: Option<i32>) -> Result<Child> {
+/// Supervisor-side handle to the worker readiness handshake: the path the
+/// spawned child will write its ready-file to (see
+/// `soth_proxy::drain_signal::WORKER_READY_FILE_ENV`).
+struct WorkerReadyProbe {
+    path: PathBuf,
+}
+
+impl WorkerReadyProbe {
+    fn new() -> Self {
+        let path = soth_home_dir()
+            .join("run")
+            .join(format!("worker_ready_{}.json", uuid::Uuid::new_v4()));
+        Self { path }
+    }
+
+    fn is_ready(&self) -> bool {
+        self.path.exists()
+    }
+}
+
+impl Drop for WorkerReadyProbe {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+async fn spawn_proxy_process(
+    config_path: &Path,
+    listener_fd: Option<i32>,
+) -> Result<(Child, WorkerReadyProbe)> {
     let current_exe =
         std::env::current_exe().context("resolve current executable for proxy worker")?;
+    let ready_probe = WorkerReadyProbe::new();
+    if let Some(parent) = ready_probe.path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     let mut cmd = Command::new(current_exe);
     // `start --daemon-child` + SOTH_PROXY_WORKER=1 selects the in-process MITM
     // runtime path in `run()` below, replacing the historical `soth-proxy`
@@ -623,6 +657,10 @@ async fn spawn_proxy_process(config_path: &Path, listener_fd: Option<i32>) -> Re
     cmd.arg("start").arg("--daemon-child");
     cmd.env(PROXY_WORKER_ENV, "1");
     cmd.env("SOTH_PROXY_CONFIG", config_path);
+    cmd.env(
+        soth_proxy::drain_signal::WORKER_READY_FILE_ENV,
+        &ready_probe.path,
+    );
     if let Some(fd) = listener_fd {
         cmd.env("SOTH_LISTENER_FD", fd.to_string());
     }
@@ -643,8 +681,10 @@ async fn spawn_proxy_process(config_path: &Path, listener_fd: Option<i32>) -> Re
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
     }
-    cmd.spawn()
-        .map_err(|error| anyhow::anyhow!("failed launching proxy worker: {error}"))
+    let child = cmd
+        .spawn()
+        .map_err(|error| anyhow::anyhow!("failed launching proxy worker: {error}"))?;
+    Ok((child, ready_probe))
 }
 
 /// Env var toggle that re-executed child processes use to enter in-process
@@ -790,16 +830,56 @@ async fn supervise_proxy(
             }
             ProxyExit::Reload => {
                 info!("reload requested (SIGHUP or network change) — performing graceful child rotation");
-                let mut new_child = spawn_proxy_process(config_path, listener_fd)
+                // Windows: the port cannot be shared (no FD passing; the
+                // worker binds with SO_EXCLUSIVEADDRUSE), so rotation is
+                // sequenced — signal the drain FIRST. The old child closes
+                // its listener within milliseconds (freeing the port for
+                // the new child's bind-retry loop) and keeps draining
+                // in-flight flows in the background while the new child
+                // starts. On Unix the inherited-listener overlap flow is
+                // kept: new child up first, then drain the old.
+                #[cfg(windows)]
+                let old_child_draining = {
+                    let signaled = child.id().map(signal_windows_drain_event).unwrap_or(false);
+                    if !signaled {
+                        warn!("could not signal drain event on old proxy child; hard-killing before respawn");
+                        let _ = terminate_child(child).await;
+                    }
+                    signaled
+                };
+
+                let (mut new_child, ready_probe) = spawn_proxy_process(config_path, listener_fd)
                     .await
                     .context("spawn new soth-proxy for graceful rotation")?;
-                if let Err(error) = wait_for_listener_start(&mut new_child, expected_port).await {
+                if let Err(error) =
+                    wait_for_listener_start(&mut new_child, expected_port, &ready_probe).await
+                {
+                    // Unix: the old child is untouched, keep serving on it.
+                    // Windows: the old child is already draining; fall
+                    // through — the supervisor loop observes its exit and
+                    // respawns via the normal restart path.
                     warn!(error = %error, "new proxy child failed to start; keeping old child");
                     let _ = terminate_child(&mut new_child).await;
                     continue;
                 }
                 info!("new proxy child healthy — draining old child");
+                #[cfg(unix)]
                 graceful_stop_child(child).await?;
+                #[cfg(windows)]
+                if old_child_draining {
+                    match tokio::time::timeout(Duration::from_secs(30), child.wait()).await {
+                        Ok(Ok(status)) => {
+                            info!(status = %status, "old proxy child exited after drain");
+                        }
+                        Ok(Err(error)) => {
+                            warn!(error = %error, "error waiting for old proxy child");
+                        }
+                        Err(_) => {
+                            warn!("old proxy child did not exit within 30s drain window; killing");
+                            let _ = terminate_child(child).await;
+                        }
+                    }
+                }
                 *child = new_child;
                 last_healthy = Instant::now();
                 consecutive_failures = 0;
@@ -865,11 +945,17 @@ async fn supervise_proxy(
         );
         tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
 
-        *child = spawn_proxy_process(config_path, listener_fd)
+        let (respawned_child, ready_probe) = spawn_proxy_process(config_path, listener_fd)
             .await
             .context("respawn soth-proxy process")?;
-        if let Err(error) =
-            wait_for_listener_start_with_timeout(child, expected_port, next_startup_timeout).await
+        *child = respawned_child;
+        if let Err(error) = wait_for_listener_start_with_timeout(
+            child,
+            expected_port,
+            next_startup_timeout,
+            &ready_probe,
+        )
+        .await
         {
             warn!(
                 timeout_secs = next_startup_timeout.as_secs(),
@@ -981,23 +1067,97 @@ async fn graceful_stop_child(child: &mut Child) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+/// Windows equivalent of the SIGUSR1 drain: sets the named kernel event the
+/// worker created at startup (`Local\soth-worker-drain-{pid}`, see
+/// `soth_proxy::drain_signal`), then waits up to 30 seconds for exit.
+/// Falls back to a hard kill if the event can't be opened (worker predates
+/// this protocol, or died) or the drain window elapses.
+#[cfg(windows)]
+async fn graceful_stop_child(child: &mut Child) -> Result<()> {
+    let signaled = child.id().map(signal_windows_drain_event).unwrap_or(false);
+    if !signaled {
+        warn!("could not signal drain event on old proxy child; falling back to hard kill");
+        return terminate_child(child).await;
+    }
+    match tokio::time::timeout(Duration::from_secs(30), child.wait()).await {
+        Ok(Ok(status)) => {
+            info!(status = %status, "old proxy child exited after drain");
+        }
+        Ok(Err(error)) => {
+            warn!(error = %error, "error waiting for old proxy child");
+        }
+        Err(_) => {
+            warn!("old proxy child did not exit within 30s drain window; killing");
+            let _ = terminate_child(child).await;
+        }
+    }
+    Ok(())
+}
+
+/// Open the worker's named drain event and set it. Returns `false` when the
+/// event doesn't exist or can't be signaled — callers fall back to a hard
+/// kill, matching the pre-drain behavior.
+#[cfg(windows)]
+fn signal_windows_drain_event(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenEventW, SetEvent, EVENT_MODIFY_STATE};
+
+    let name: Vec<u16> = soth_proxy::drain_signal::drain_event_name(pid)
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let handle = OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr());
+        if handle.is_null() {
+            return false;
+        }
+        let signaled = SetEvent(handle) != 0;
+        CloseHandle(handle);
+        signaled
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 async fn graceful_stop_child(child: &mut Child) -> Result<()> {
     terminate_child(child).await
 }
 
-async fn wait_for_listener_start(child: &mut Child, port: u16) -> Result<()> {
-    wait_for_listener_start_with_timeout(child, port, listener_startup_timeout()).await
+async fn wait_for_listener_start(
+    child: &mut Child,
+    port: u16,
+    ready_probe: &WorkerReadyProbe,
+) -> Result<()> {
+    wait_for_listener_start_with_timeout(child, port, listener_startup_timeout(), ready_probe).await
 }
 
+/// Wait until the spawned worker reports ready.
+///
+/// Primary signal: the worker's ready-file (written by that exact child once
+/// its listener is live). The old TCP probe on `127.0.0.1:<port>` could not
+/// distinguish the new child's listener from the old child's during rotation
+/// — and on Unix it didn't even prove the worker was up, since the
+/// supervisor itself holds the inherited listener. The probe is kept only as
+/// a late fallback for version-skewed workers that predate the ready-file
+/// protocol (possible across hot-updates): it is consulted only after half
+/// the startup budget has elapsed with no ready-file.
 async fn wait_for_listener_start_with_timeout(
     child: &mut Child,
     port: u16,
     timeout: Duration,
+    ready_probe: &WorkerReadyProbe,
 ) -> Result<()> {
-    let deadline = Instant::now() + timeout;
+    let start = Instant::now();
+    let deadline = start + timeout;
+    let probe_fallback_after = start + timeout / 2;
     loop {
-        if is_local_listener_ready(port) {
+        if ready_probe.is_ready() {
+            return Ok(());
+        }
+        if Instant::now() >= probe_fallback_after && is_local_listener_ready(port) {
+            warn!(
+                port,
+                "worker ready-file not seen but port answers; accepting via legacy probe (version-skewed worker?)"
+            );
             return Ok(());
         }
         if let Some(status) = child
@@ -1009,7 +1169,7 @@ async fn wait_for_listener_start_with_timeout(
         if Instant::now() >= deadline {
             let _ = terminate_child(child).await;
             anyhow::bail!(
-                "soth-proxy did not open 127.0.0.1:{} within {}s startup timeout",
+                "soth-proxy did not report ready on 127.0.0.1:{} within {}s startup timeout",
                 port,
                 timeout.as_secs()
             );
@@ -1778,14 +1938,30 @@ async fn run_classify_daemon_worker() -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn worker_ready_probe_removes_file_on_drop() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("worker_ready_test.json");
+        let probe = WorkerReadyProbe { path: path.clone() };
+        assert!(!probe.is_ready());
+        std::fs::write(&path, b"{\"pid\": 1}\n").expect("write ready file");
+        assert!(probe.is_ready());
+        drop(probe);
+        assert!(!path.exists(), "probe drop must clean up the ready file");
+    }
+
     fn with_temp_home<T>(f: impl FnOnce(std::path::PathBuf) -> T + std::panic::UnwindSafe) -> T {
         let guard = crate::commands::proxy::lock_test_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let old_home = std::env::var_os("HOME");
+        // dirs::home_dir() reads USERPROFILE on Windows, not HOME — override
+        // both so `~` expansion can't escape the temp sandbox.
+        let old_userprofile = std::env::var_os("USERPROFILE");
         let old_soth_home = std::env::var_os("SOTH_HOME_DIR");
         let soth_home = temp.path().join(".soth");
         unsafe {
             std::env::set_var("HOME", temp.path());
+            std::env::set_var("USERPROFILE", temp.path());
             std::env::set_var("SOTH_HOME_DIR", &soth_home);
         }
 
@@ -1797,6 +1973,14 @@ mod tests {
             },
             None => unsafe {
                 std::env::remove_var("HOME");
+            },
+        }
+        match old_userprofile {
+            Some(value) => unsafe {
+                std::env::set_var("USERPROFILE", value);
+            },
+            None => unsafe {
+                std::env::remove_var("USERPROFILE");
             },
         }
         match old_soth_home {

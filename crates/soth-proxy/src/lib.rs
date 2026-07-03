@@ -1,6 +1,7 @@
-// unsafe_code is denied crate-wide; the single exception is sqlite_vec, which
-// must call sqlite3_auto_extension via FFI. deny (not forbid) is used so that
-// the per-module allow override on sqlite_vec is permitted.
+// unsafe_code is denied crate-wide; the exceptions are sqlite_vec (must call
+// sqlite3_auto_extension via FFI) and drain_signal's Windows kernel-event
+// syscalls. deny (not forbid) is used so that per-item allow overrides are
+// permitted.
 #![deny(unsafe_code)]
 #![allow(clippy::too_many_arguments)]
 
@@ -14,6 +15,7 @@
 pub mod classify_task;
 pub mod config;
 pub mod db;
+pub mod drain_signal;
 pub mod error;
 pub mod gating;
 pub mod runtime;

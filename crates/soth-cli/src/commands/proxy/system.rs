@@ -1695,10 +1695,14 @@ mod tests {
         let guard = crate::commands::proxy::lock_test_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let old_home = env::var_os("HOME");
+        // dirs::home_dir() reads USERPROFILE on Windows, not HOME — override
+        // both so `~` expansion can't escape the temp sandbox.
+        let old_userprofile = env::var_os("USERPROFILE");
         let old_soth_home = env::var_os("SOTH_HOME_DIR");
         let soth_home = temp.path().join(".soth");
         unsafe {
             env::set_var("HOME", temp.path());
+            env::set_var("USERPROFILE", temp.path());
             env::set_var("SOTH_HOME_DIR", &soth_home);
         }
         let result = f();
@@ -1708,6 +1712,14 @@ mod tests {
             },
             None => unsafe {
                 env::remove_var("HOME");
+            },
+        }
+        match old_userprofile {
+            Some(value) => unsafe {
+                env::set_var("USERPROFILE", value);
+            },
+            None => unsafe {
+                env::remove_var("USERPROFILE");
             },
         }
         match old_soth_home {

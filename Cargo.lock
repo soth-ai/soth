@@ -4093,6 +4093,7 @@ dependencies = [
  "dirs",
  "ed25519-dalek",
  "hex",
+ "ipconfig",
  "libc",
  "owo-colors",
  "rand 0.8.5",
@@ -4406,6 +4407,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "uuid",
+ "windows-sys 0.59.0",
  "zeroize",
 ]
 

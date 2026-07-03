@@ -75,6 +75,16 @@ jobs:
           cargo test --lib -p soth-extensions
           cargo test --lib -p soth-parse
           cargo test --lib -p soth-code
+      # soth-proxy and soth-cli carry Windows-divergent runtime code the
+      # ubuntu PR lanes never compile: the named drain event
+      # (drain_signal), the ipconfig-based network watcher, and the
+      # sequenced rotation in the supervisor. Test them natively so
+      # cfg(windows) API mistakes surface before a release.
+      - name: proxy + cli tests on Windows
+        shell: bash
+        run: |
+          cargo test --lib -p soth-proxy
+          cargo test --bins -p soth-cli
 
   # Phase 4b sidecar updater — Windows cross-compile validation.
   # The crate is windows-only at runtime; we cross-compile from
@@ -90,7 +100,9 @@ jobs:
       - shell: bash
         run: |
           cargo build -p soth-cli-update-sidecar --bin soth-update --release
-          cargo test --lib -p soth-cli-update-sidecar
+          # The sidecar is a binary-only crate: `cargo test --lib` errors
+          # with "no library targets found". Test the bin target instead.
+          cargo test --bins -p soth-cli-update-sidecar
 
   # FFI conformance is also a per-PR lane (paths-gated on
   # sdk-core / detect / classify / bindings / fixtures), but we
