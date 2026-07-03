@@ -100,7 +100,9 @@ jobs:
       - shell: bash
         run: |
           cargo build -p soth-cli-update-sidecar --bin soth-update --release
-          cargo test --lib -p soth-cli-update-sidecar
+          # The sidecar is a binary-only crate: `cargo test --lib` errors
+          # with "no library targets found". Test the bin target instead.
+          cargo test --bins -p soth-cli-update-sidecar
 
   # FFI conformance is also a per-PR lane (paths-gated on
   # sdk-core / detect / classify / bindings / fixtures), but we
