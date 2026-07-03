@@ -944,14 +944,29 @@ pub struct CodeAgentConfig {
     pub enabled: bool,
 }
 
-pub fn default_config_path() -> PathBuf {
+/// Resolve the user's home directory for `~` expansion and default soth
+/// paths. `$HOME` wins when set: Unix always sets it, and on Windows —
+/// where it is normally absent — honoring it matches every other soth
+/// path helper (which honor `SOTH_HOME_DIR`) and keeps test sandboxes
+/// working. `dirs::home_dir()` alone won't do: on Windows it resolves via
+/// the known-folder OS API and ignores the environment entirely.
+fn home_dir() -> Option<PathBuf> {
+    if let Some(home) = std::env::var_os("HOME") {
+        if !home.is_empty() {
+            return Some(PathBuf::from(home));
+        }
+    }
     dirs::home_dir()
+}
+
+pub fn default_config_path() -> PathBuf {
+    home_dir()
         .map(|home| home.join(".soth").join(DEFAULT_CONFIG_FILE))
         .unwrap_or_else(|| PathBuf::from(".soth").join(DEFAULT_CONFIG_FILE))
 }
 
 pub fn default_device_id_path() -> PathBuf {
-    dirs::home_dir()
+    home_dir()
         .map(|home| home.join(".soth").join(DEFAULT_DEVICE_ID_FILE))
         .unwrap_or_else(|| PathBuf::from(".soth").join(DEFAULT_DEVICE_ID_FILE))
 }
@@ -968,7 +983,7 @@ pub fn discover_default_config_path() -> Option<PathBuf> {
 pub fn expand_tilde(path: &Path) -> PathBuf {
     let raw = path.to_string_lossy();
     if let Some(rest) = raw.strip_prefix("~/") {
-        return dirs::home_dir()
+        return home_dir()
             .map(|home| home.join(rest))
             .unwrap_or_else(|| PathBuf::from(raw.as_ref()));
     }
