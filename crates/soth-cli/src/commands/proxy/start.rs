@@ -33,6 +33,16 @@ const MAX_RESTART_ATTEMPTS: u32 = 10;
 const RESTART_BACKOFF_BASE_MS: u64 = 1_000;
 const RESTART_BACKOFF_MAX_MS: u64 = 30_000;
 
+/// Fail-open watchdog cadence. Every tick the watchdog checks whether the
+/// local listener answers; if it has been dead for
+/// [`WATCHDOG_DEAD_TICKS`] consecutive ticks *and* the OS proxy still
+/// points at soth, it disables the system proxy so the user falls back to
+/// direct connectivity instead of a dead port. The dead threshold is set
+/// above a normal rotation/restart window so it never fires mid-rotation.
+const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const WATCHDOG_DEAD_TICKS: u32 = 3;
+const WATCHDOG_RECOVER_TICKS: u32 = 2;
+
 /// If the supervisor loop sees a wall-clock gap larger than this between two
 /// iterations, we assume the OS was suspended (sleep / hibernate / Modern
 /// Standby) for that duration. Sleep > 60s is the threshold because tokio's
@@ -170,10 +180,25 @@ pub async fn run(
     #[cfg(not(unix))]
     let listener_fd: Option<i32> = None;
 
-    let (mut child, ready_probe) = spawn_proxy_process(generated_path.as_path(), listener_fd)
+    // Crash-repair: a prior session that died uncleanly (SIGKILL/OOM, or a
+    // supervisor that exhausted its budget) can leave the OS proxy pointed at
+    // 127.0.0.1:<port>. If *this* startup also fails to bring a worker up, we
+    // must not return leaving that dangling proxy in place — the user would
+    // be stranded on a dead port. Route worker-startup failures through
+    // fail_startup_open, which disables a soth-signature proxy before
+    // propagating the error. (A bind conflict instead means the old listener
+    // is still up, so the user isn't stranded and the signature check is moot.)
+    let (mut child, ready_probe) = match spawn_proxy_process(generated_path.as_path(), listener_fd)
         .await
-        .context("spawn soth-proxy process")?;
-    wait_for_listener_start(&mut child, expected_port, &ready_probe).await?;
+        .context("spawn soth-proxy process")
+    {
+        Ok(value) => value,
+        Err(error) => return fail_startup_open(expected_port, error).await,
+    };
+    if let Err(error) = wait_for_listener_start(&mut child, expected_port, &ready_probe).await {
+        let _ = terminate_child(&mut child).await;
+        return fail_startup_open(expected_port, error).await;
+    }
     drop(ready_probe);
 
     // Historian sibling process. Spawned only when both `enabled` and
@@ -286,6 +311,34 @@ pub async fn run(
         listener_fd,
     )
     .await
+}
+
+/// Fail OPEN on a worker-startup error: if the OS proxy carries soth's
+/// signature **and no listener is actually answering on the port**, disable
+/// it so connectivity falls back to direct, then return the original error
+/// unchanged.
+///
+/// The dead-listener check is essential: a startup can fail with the port
+/// already served by a *healthy* instance (e.g. a Windows bind-conflict where
+/// the supervisor doesn't own an inherited socket). Disabling on the
+/// signature alone would then tear down that working instance's system proxy
+/// — turning off interception with no one to re-enable it. We only clear the
+/// proxy when it points at soth *and* nothing is listening (the genuine
+/// dangling-from-a-crash case). Signature-gated, so it never touches a
+/// foreign proxy.
+async fn fail_startup_open(expected_port: u16, error: anyhow::Error) -> Result<()> {
+    if super::system::soth_proxy_signature_active(expected_port)
+        && !is_local_listener_ready(expected_port)
+    {
+        warn!(
+            port = expected_port,
+            "worker failed to start, a soth system proxy is active, and no listener is answering (dangling from a prior crash) — disabling it so connectivity falls back to direct"
+        );
+        if let Err(disable_error) = super::system::disable_quiet().await {
+            warn!(%disable_error, "failed to disable dangling system proxy during startup crash-repair; user may need `soth off`");
+        }
+    }
+    Err(error)
 }
 
 fn ensure_ca_runtime_health(paths: &super::ca_health::ResolvedCaPaths, quiet: bool) -> Result<()> {
@@ -771,6 +824,138 @@ fn self_detach_daemon(port: Option<u16>, config_path: Option<&PathBuf>, quiet: b
 /// kill the unhealthy child and respawn it, with exponential backoff up to
 /// [`MAX_RESTART_ATTEMPTS`] consecutive failures.  The restart counter
 /// resets every time the proxy runs healthily for at least 60 seconds.
+/// Owns the fail-open watchdog task and aborts it when dropped, so the
+/// watchdog can never outlive the supervisor and re-enable a proxy the
+/// supervisor is tearing down.
+struct ProxyHealthWatchdog {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl ProxyHealthWatchdog {
+    fn spawn(expected_port: u16) -> Self {
+        let handle = tokio::spawn(proxy_health_watchdog_loop(expected_port));
+        Self { handle }
+    }
+}
+
+impl Drop for ProxyHealthWatchdog {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+/// The reconciler loop. Every [`WATCHDOG_POLL_INTERVAL`] it checks the local
+/// listener. Two transitions, both hysteresis-guarded to avoid flapping:
+///
+/// - **Healthy → disabled:** listener dead for [`WATCHDOG_DEAD_TICKS`]
+///   consecutive ticks *and* the OS proxy still carries soth's signature →
+///   disable the system proxy (fail open to direct). The dead threshold sits
+///   above a normal rotation window so a graceful rotation never trips it.
+/// - **Disabled → re-enabled:** once the listener answers again for
+///   [`WATCHDOG_RECOVER_TICKS`] ticks, re-enable so interception resumes. We
+///   only ever re-enable a proxy *we* disabled in this loop.
+///
+/// It never disables a proxy that isn't soth's (gated on
+/// [`super::system::soth_proxy_signature_active`]).
+async fn proxy_health_watchdog_loop(expected_port: u16) {
+    let mut ticker = tokio::time::interval(WATCHDOG_POLL_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Skip the immediate first tick so we don't act before the worker that
+    // supervise_proxy just confirmed has had a chance to settle.
+    ticker.tick().await;
+
+    let mut dead_ticks: u32 = 0;
+    let mut ready_ticks: u32 = 0;
+    // True only while the proxy is off *because this loop turned it off*.
+    let mut disabled_by_watchdog = false;
+
+    loop {
+        ticker.tick().await;
+
+        // Both probes are synchronous and can block (a 500ms connect; several
+        // subprocess reads for the signature). Run them off the async workers
+        // so a per-tick block can't starve the supervisor on a small runtime.
+        // A join failure (a panic in the probe) resolves to "not ready" /
+        // "not ours" — the safe direction, since neither authorizes a disable.
+        let listener_ready =
+            tokio::task::spawn_blocking(move || is_local_listener_ready(expected_port))
+                .await
+                .unwrap_or(false);
+
+        if listener_ready {
+            dead_ticks = 0;
+            if disabled_by_watchdog {
+                // Respect an explicit `soth off` issued during the outage: if
+                // the user turned the proxy off, do not re-enable it behind
+                // their back — stop trying and leave it off.
+                if super::system::user_disabled_proxy() {
+                    info!(
+                        port = expected_port,
+                        "listener recovered but the user disabled the proxy (soth off) — not re-enabling"
+                    );
+                    disabled_by_watchdog = false;
+                    ready_ticks = 0;
+                    continue;
+                }
+                ready_ticks = ready_ticks.saturating_add(1);
+                if ready_ticks >= WATCHDOG_RECOVER_TICKS {
+                    info!(
+                        port = expected_port,
+                        "listener recovered — re-enabling system proxy that the watchdog had disabled"
+                    );
+                    match super::system::enable_quiet(Some(expected_port)).await {
+                        Ok(()) => {
+                            disabled_by_watchdog = false;
+                            ready_ticks = 0;
+                        }
+                        Err(error) => {
+                            warn!(%error, "watchdog failed to re-enable system proxy; will retry next tick");
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Listener is not answering.
+        ready_ticks = 0;
+        if disabled_by_watchdog {
+            // Already failed open; nothing more to do until it recovers.
+            continue;
+        }
+        dead_ticks = dead_ticks.saturating_add(1);
+        if dead_ticks < WATCHDOG_DEAD_TICKS {
+            continue;
+        }
+
+        // Sustained dead listener. Only act if the OS proxy still points at
+        // us — otherwise there's nothing of ours to clear.
+        let signature_active = tokio::task::spawn_blocking(move || {
+            super::system::soth_proxy_signature_active(expected_port)
+        })
+        .await
+        .unwrap_or(false);
+        if !signature_active {
+            continue;
+        }
+        warn!(
+            port = expected_port,
+            dead_secs = (dead_ticks as u64) * WATCHDOG_POLL_INTERVAL.as_secs(),
+            "system proxy points at soth but the listener has been dead — disabling system proxy so connectivity falls back to direct"
+        );
+        match super::system::disable_quiet().await {
+            Ok(()) => {
+                disabled_by_watchdog = true;
+            }
+            Err(error) => {
+                warn!(%error, "watchdog failed to disable system proxy; will retry next tick");
+                // Keep dead_ticks at threshold so we retry immediately.
+                dead_ticks = WATCHDOG_DEAD_TICKS;
+            }
+        }
+    }
+}
+
 async fn supervise_proxy(
     child: &mut Child,
     config_path: &Path,
@@ -788,6 +973,13 @@ async fn supervise_proxy(
     // address reassignment) and triggers a graceful child rotation so the
     // upstream connection pool isn't left bound to the old gateway.
     let mut network_change_rx = super::network_watcher::spawn();
+
+    // Fail-open watchdog: continuously enforces "if the OS proxy points at
+    // soth, a healthy listener MUST exist." Runs independently of the
+    // restart loop below so it also covers cases the loop can't see (a
+    // wedged-but-not-exited worker, a listener that stops accepting). Aborted
+    // when supervise_proxy returns (via the guard's Drop).
+    let _watchdog = ProxyHealthWatchdog::spawn(expected_port);
 
     loop {
         let exit_reason =
@@ -929,6 +1121,20 @@ async fn supervise_proxy(
         }
 
         if consecutive_failures > MAX_RESTART_ATTEMPTS {
+            // Fail OPEN before giving up: the worker is persistently broken,
+            // so leaving the OS proxy pointed at 127.0.0.1:<port> would strand
+            // the user with no internet (every app that honors the system
+            // proxy dials a dead port). Revert to direct first, then bail.
+            // Signature-checked inside disable so we never clear a foreign
+            // proxy. Best-effort — a disable failure must not mask the bail.
+            if super::system::soth_proxy_signature_active(expected_port) {
+                warn!(
+                    "soth-proxy exhausted its restart budget; disabling the system proxy so connectivity falls back to direct"
+                );
+                if let Err(error) = super::system::disable_quiet().await {
+                    warn!(%error, "failed to disable system proxy on give-up; user may need `soth off`");
+                }
+            }
             anyhow::bail!(
                 "soth-proxy failed {MAX_RESTART_ATTEMPTS} consecutive times — giving up. Check logs for root cause."
             );

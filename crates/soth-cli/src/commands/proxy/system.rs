@@ -151,7 +151,16 @@ pub async fn enable(port: Option<u16>) -> Result<()> {
     enable_internal(port, true).await
 }
 
+/// Enable without printing user-facing output — for background callers like
+/// the fail-open watchdog re-enabling after a recovery.
+pub async fn enable_quiet(port: Option<u16>) -> Result<()> {
+    enable_internal(port, false).await
+}
+
 async fn enable_internal(port: Option<u16>, print_user_output: bool) -> Result<()> {
+    // Any enable — user-initiated (`soth on`/`up`) or the watchdog's recovery
+    // re-enable — clears the "user turned it off" intent.
+    clear_user_proxy_off_sentinel();
     let proxy_port = port.unwrap_or(DEFAULT_PROXY_PORT);
     let proxy_addr = format!("127.0.0.1:{proxy_port}");
     #[cfg(target_os = "linux")]
@@ -241,6 +250,14 @@ pub async fn disable_quiet() -> Result<()> {
 }
 
 async fn disable_internal(print_user_output: bool) -> Result<()> {
+    // A user-facing disable (`soth off` / `soth doctor --reset-network`, which
+    // print output) records explicit user intent so the still-running
+    // watchdog won't re-enable behind the user's back. The watchdog's own
+    // quiet disable (print_user_output=false) must NOT set it, or the
+    // watchdog could never re-enable after its own fail-open action.
+    if print_user_output {
+        set_user_proxy_off_sentinel();
+    }
     #[cfg(target_os = "linux")]
     let mut managed_apply = true;
     #[cfg(not(target_os = "linux"))]
@@ -322,6 +339,59 @@ pub async fn status() -> Result<bool> {
     Ok(false)
 }
 
+/// Is the OS proxy currently enabled *and pointing at soth's own
+/// loopback:port signature*?
+///
+/// This is deliberately stricter than [`status`]: it returns `true` only
+/// when the active system proxy is one we set (loopback host + our port),
+/// never for a foreign loopback tool (Charles, mitmproxy) or a real
+/// upstream proxy. The fail-open watchdog gates on this so it can only ever
+/// clear *soth's* proxy — never strand a user by disabling someone else's.
+///
+/// Best-effort: any read error resolves to `false` (don't act on
+/// uncertainty), which is the safe direction for a function whose `true`
+/// authorizes disabling the proxy.
+pub fn soth_proxy_signature_active(port: u16) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let Ok(services) = get_macos_network_services() else {
+            return false;
+        };
+        return !list_macos_services_using_soth_signature(&services, port).is_empty();
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Only the gsettings-managed path can be inspected reliably; the
+        // env-var fallback isn't a persistent OS setting we can read back.
+        if which::which("gsettings").is_err() || !gnome_proxy_schema_available() {
+            return false;
+        }
+        let mode_manual = get_linux_proxy_mode().as_deref() == Some("manual");
+        let host_loopback = get_linux_proxy_host("https")
+            .map(|host| matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1"))
+            .unwrap_or(false);
+        let port_matches = get_linux_proxy_port("https") == Some(port);
+        return mode_manual && host_loopback && port_matches;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if !read_windows_proxy_enabled().unwrap_or(false) {
+            return false;
+        }
+        let registered = read_windows_string_value("ProxyServer").unwrap_or(None);
+        let registered = registered.unwrap_or_default();
+        return windows_proxy_value_is_soth(registered.trim(), port);
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = port;
+        false
+    }
+}
+
 fn get_ca_path() -> PathBuf {
     soth_home_dir().join("certs").join("soth-mitm-ca.pem")
 }
@@ -374,6 +444,36 @@ fn save_system_proxy_state(state: &SystemProxyState) -> Result<()> {
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn remove_system_proxy_state() {
     let _ = std::fs::remove_file(system_proxy_state_path());
+}
+
+/// Sentinel marking that the user explicitly turned the proxy off (via
+/// `soth off` / `soth doctor --reset-network`) while the daemon is still
+/// running. The fail-open watchdog consults it before re-enabling: without
+/// it, a `soth off` issued during a watchdog-induced outage would be silently
+/// undone when the worker recovered. Written by the user-facing disable path
+/// only (not the watchdog's own quiet disable) and cleared by any enable.
+const USER_PROXY_OFF_SENTINEL: &str = "user_proxy_off";
+
+fn user_proxy_off_sentinel_path() -> PathBuf {
+    soth_home_dir().join("run").join(USER_PROXY_OFF_SENTINEL)
+}
+
+fn set_user_proxy_off_sentinel() {
+    let path = user_proxy_off_sentinel_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, b"1");
+}
+
+fn clear_user_proxy_off_sentinel() {
+    let _ = std::fs::remove_file(user_proxy_off_sentinel_path());
+}
+
+/// True when the user has explicitly disabled the proxy and not re-enabled it.
+/// The watchdog uses this to avoid re-enabling against the user's intent.
+pub fn user_disabled_proxy() -> bool {
+    user_proxy_off_sentinel_path().exists()
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
@@ -1406,7 +1506,7 @@ async fn configure_windows_proxy(enable: bool, port: u16, print_user_output: boo
             let registered = read_windows_string_value("ProxyServer").unwrap_or(None);
             let registered_str = registered.as_deref().unwrap_or("").trim();
             let proxy_enabled = read_windows_proxy_enabled().unwrap_or(false);
-            let points_at_loopback = registered_str.starts_with(&proxy_server);
+            let points_at_loopback = windows_proxy_value_is_soth(registered_str, port);
             if proxy_enabled && points_at_loopback {
                 warn!(
                     "system proxy state file missing but registered proxy is {proxy_server}; treating as soth-owned and disabling"
@@ -1623,6 +1723,25 @@ fn read_windows_proxy_enabled() -> Result<bool> {
     Ok(normalized.parse::<u32>().unwrap_or(0) != 0)
 }
 
+/// Does a Windows `ProxyServer` registry value point at soth's loopback:port?
+///
+/// EXACT token match, never a prefix. `ProxyServer` is either a bare
+/// `host:port` (one proxy for all protocols) or a `;`-separated list of
+/// `scheme=host:port` entries. A prefix match (`starts_with("127.0.0.1:8")`)
+/// would falsely claim a *foreign* proxy on e.g. `127.0.0.1:8080` as soth's
+/// when soth is on port `8` — leading the watchdog / disable path to clear
+/// someone else's proxy. So we compare each entry's `host:port` token exactly.
+#[cfg(target_os = "windows")]
+fn windows_proxy_value_is_soth(registered: &str, port: u16) -> bool {
+    let expected_v4 = format!("127.0.0.1:{port}");
+    let expected_local = format!("localhost:{port}");
+    registered.split(';').any(|part| {
+        // Strip an optional `scheme=` prefix, then compare the host:port token.
+        let token = part.rsplit('=').next().unwrap_or(part).trim();
+        token == expected_v4 || token == expected_local
+    })
+}
+
 #[cfg(target_os = "windows")]
 fn read_windows_string_value(value_name: &str) -> Result<Option<String>> {
     let Some((value_type, value)) = query_windows_reg_value(value_name)? else {
@@ -1741,6 +1860,17 @@ mod tests {
         assert!(path.to_string_lossy().contains("soth-mitm-ca.pem"));
     }
 
+    #[test]
+    fn user_proxy_off_sentinel_round_trips() {
+        with_temp_home(|| {
+            assert!(!user_disabled_proxy(), "starts clear");
+            set_user_proxy_off_sentinel();
+            assert!(user_disabled_proxy(), "set marks user-off");
+            clear_user_proxy_off_sentinel();
+            assert!(!user_disabled_proxy(), "clear removes it");
+        });
+    }
+
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn test_merge_proxy_bypass_domains_preserves_existing_and_adds_defaults() {
@@ -1839,5 +1969,25 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
             parsed,
             Some(("REG_SZ".to_string(), "127.0.0.1:18881".to_string()))
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_proxy_value_is_soth_exact_match_only() {
+        // Bare form.
+        assert!(windows_proxy_value_is_soth("127.0.0.1:8080", 8080));
+        assert!(windows_proxy_value_is_soth("localhost:8080", 8080));
+        // List form (scheme=host:port).
+        assert!(windows_proxy_value_is_soth(
+            "http=127.0.0.1:8080;https=127.0.0.1:8080",
+            8080
+        ));
+        // Foreign proxy whose port has ours as a numeric prefix must NOT match.
+        assert!(!windows_proxy_value_is_soth("127.0.0.1:10800", 1080));
+        assert!(!windows_proxy_value_is_soth("127.0.0.1:8080", 8));
+        assert!(!windows_proxy_value_is_soth("127.0.0.1:8000", 80));
+        // Different host / not ours.
+        assert!(!windows_proxy_value_is_soth("10.0.0.1:8080", 8080));
+        assert!(!windows_proxy_value_is_soth("", 8080));
     }
 }

@@ -52,6 +52,11 @@ struct SystemProxyDiagnostics {
     state_port: Option<u16>,
     owner_id: Option<String>,
     owner_matches_state: Option<bool>,
+    /// Whether the *live* OS proxy setting currently carries soth's
+    /// loopback:port signature. Unlike the fields above (which only read
+    /// soth's own state file), this queries the actual OS config — the only
+    /// way to detect a dangling proxy left by a crashed prior session.
+    os_signature_active: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -460,7 +465,7 @@ fn build_report(config_path: Option<PathBuf>) -> DoctorReport {
         (Some(a), Some(b)) => Some(a == b),
         _ => None,
     };
-    let system_proxy = SystemProxyDiagnostics {
+    let mut system_proxy = SystemProxyDiagnostics {
         state_file: PathDetails {
             path: state_file.display().to_string(),
             exists: state_file.exists(),
@@ -477,6 +482,8 @@ fn build_report(config_path: Option<PathBuf>) -> DoctorReport {
         state_port: state.as_ref().and_then(|v| v.port),
         owner_id,
         owner_matches_state,
+        // Filled in below once expected_port is resolved.
+        os_signature_active: false,
     };
 
     let ca_paths = super::ca_health::resolve_ca_paths(&config);
@@ -544,6 +551,7 @@ fn build_report(config_path: Option<PathBuf>) -> DoctorReport {
         .map(|m| m.port)
         .or_else(|| state.as_ref().and_then(|s| s.port))
         .unwrap_or(config.forward_proxy.port);
+    system_proxy.os_signature_active = super::system::soth_proxy_signature_active(expected_port);
     let local_listener_open = is_loopback_listener_open(expected_port);
     let details = collect_loopback_details(expected_port);
     let loopback_bindings = LoopbackBindings {
@@ -684,16 +692,38 @@ fn compute_findings(report: &DoctorReport) -> Vec<DoctorFinding> {
     }
 
     if !report.loopback_bindings.local_listener_open {
-        findings.push(DoctorFinding {
-            level: "warn".to_string(),
-            code: "listener_not_open".to_string(),
-            message: format!(
-                "No listener reachable at 127.0.0.1:{}.",
-                report.loopback_bindings.expected_port
-            ),
-            remediation: "Start proxy with `soth start` (or `soth up`) and re-run doctor."
-                .to_string(),
-        });
+        if report.system_proxy.os_signature_active {
+            // The dangerous case: the OS proxy still points at soth but no
+            // listener answers → every app that honors the system proxy is
+            // dialing a dead port = total outage. This is what a crashed /
+            // SIGKILLed prior session leaves behind. Error-level, and the
+            // remediation is to restore direct connectivity, not to start
+            // the proxy (which may itself be failing).
+            findings.push(DoctorFinding {
+                level: "error".to_string(),
+                code: "dangling_system_proxy".to_string(),
+                message: format!(
+                    "System proxy is set to 127.0.0.1:{} but no listener answers there — \
+                     traffic that honors the system proxy is being dropped.",
+                    report.loopback_bindings.expected_port
+                ),
+                remediation:
+                    "Restore direct connectivity with `soth doctor --reset-network` (or `soth off`), \
+                     then `soth up` to bring the proxy back."
+                        .to_string(),
+            });
+        } else {
+            findings.push(DoctorFinding {
+                level: "warn".to_string(),
+                code: "listener_not_open".to_string(),
+                message: format!(
+                    "No listener reachable at 127.0.0.1:{}.",
+                    report.loopback_bindings.expected_port
+                ),
+                remediation: "Start proxy with `soth start` (or `soth up`) and re-run doctor."
+                    .to_string(),
+            });
+        }
     }
 
     if findings.is_empty() {
@@ -1053,9 +1083,10 @@ mod tests {
         drop(guard);
     }
 
-    #[test]
-    fn compute_findings_flags_missing_ca() {
-        let report = DoctorReport {
+    /// Build a minimal report for compute_findings tests, with the two
+    /// knobs the listener/proxy findings key on.
+    fn report_for_findings(local_listener_open: bool, os_signature_active: bool) -> DoctorReport {
+        DoctorReport {
             managed_runtime: "unknown".to_string(),
             daemon: DaemonDiagnostics {
                 pid_file: PathDetails {
@@ -1092,6 +1123,7 @@ mod tests {
                 state_port: None,
                 owner_id: None,
                 owner_matches_state: None,
+                os_signature_active,
             },
             ca: CaDiagnostics {
                 cert_path: PathDetails {
@@ -1118,14 +1150,48 @@ mod tests {
             },
             loopback_bindings: LoopbackBindings {
                 expected_port: 8080,
-                local_listener_open: false,
+                local_listener_open,
                 details: Vec::new(),
             },
             findings: Vec::new(),
-        };
+        }
+    }
 
+    #[test]
+    fn compute_findings_flags_missing_ca() {
+        let report = report_for_findings(false, false);
         let findings = compute_findings(&report);
         assert!(findings.iter().any(|f| f.code == "ca_missing"));
         assert!(findings.iter().any(|f| f.code == "listener_not_open"));
+    }
+
+    #[test]
+    fn dead_listener_without_active_proxy_is_a_warning() {
+        let report = report_for_findings(false, false);
+        let findings = compute_findings(&report);
+        assert!(findings.iter().any(|f| f.code == "listener_not_open"));
+        assert!(!findings.iter().any(|f| f.code == "dangling_system_proxy"));
+    }
+
+    #[test]
+    fn dead_listener_with_active_proxy_is_a_dangling_error() {
+        // The catastrophic case: OS proxy points at soth but nothing listens.
+        let report = report_for_findings(false, true);
+        let findings = compute_findings(&report);
+        let dangling = findings
+            .iter()
+            .find(|f| f.code == "dangling_system_proxy")
+            .expect("dangling_system_proxy finding");
+        assert_eq!(dangling.level, "error");
+        // The plain listener warning must not also fire — the error supersedes it.
+        assert!(!findings.iter().any(|f| f.code == "listener_not_open"));
+    }
+
+    #[test]
+    fn healthy_listener_produces_no_listener_findings() {
+        let report = report_for_findings(true, true);
+        let findings = compute_findings(&report);
+        assert!(!findings.iter().any(|f| f.code == "listener_not_open"));
+        assert!(!findings.iter().any(|f| f.code == "dangling_system_proxy"));
     }
 }
