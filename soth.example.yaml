@@ -121,6 +121,14 @@ forward_proxy:
     cache_ttl: "1h"        # Certificate cache TTL
     cache_max: 10000       # Maximum cached certificates
 
+  # Upstream connect retry. On by default: a single retry (after
+  # upstream_retry_delay, bounded by the connect deadline) for transient
+  # connect failures — refused / unreachable / reset — which are routine
+  # during hotspot handoffs and gateway blips. Timeouts are never retried,
+  # so it can't mask a genuinely-stuck upstream. Set to false to disable.
+  upstream_retry_on_failure: true
+  upstream_retry_delay: "200ms"
+
   # Connection pool settings
   pool:
     max_connections_per_host: 10
