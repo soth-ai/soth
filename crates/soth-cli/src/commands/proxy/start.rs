@@ -313,15 +313,26 @@ pub async fn run(
     .await
 }
 
-/// Fail OPEN on a worker-startup error: if the OS proxy currently carries
-/// soth's signature (a dangling entry from a prior crashed session), disable
+/// Fail OPEN on a worker-startup error: if the OS proxy carries soth's
+/// signature **and no listener is actually answering on the port**, disable
 /// it so connectivity falls back to direct, then return the original error
-/// unchanged. Signature-gated, so it never clears a foreign proxy.
+/// unchanged.
+///
+/// The dead-listener check is essential: a startup can fail with the port
+/// already served by a *healthy* instance (e.g. a Windows bind-conflict where
+/// the supervisor doesn't own an inherited socket). Disabling on the
+/// signature alone would then tear down that working instance's system proxy
+/// — turning off interception with no one to re-enable it. We only clear the
+/// proxy when it points at soth *and* nothing is listening (the genuine
+/// dangling-from-a-crash case). Signature-gated, so it never touches a
+/// foreign proxy.
 async fn fail_startup_open(expected_port: u16, error: anyhow::Error) -> Result<()> {
-    if super::system::soth_proxy_signature_active(expected_port) {
+    if super::system::soth_proxy_signature_active(expected_port)
+        && !is_local_listener_ready(expected_port)
+    {
         warn!(
             port = expected_port,
-            "worker failed to start while a soth system proxy was active (likely dangling from a prior crash) — disabling it so connectivity falls back to direct"
+            "worker failed to start, a soth system proxy is active, and no listener is answering (dangling from a prior crash) — disabling it so connectivity falls back to direct"
         );
         if let Err(disable_error) = super::system::disable_quiet().await {
             warn!(%disable_error, "failed to disable dangling system proxy during startup crash-repair; user may need `soth off`");
