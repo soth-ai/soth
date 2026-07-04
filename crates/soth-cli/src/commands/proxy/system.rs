@@ -151,6 +151,12 @@ pub async fn enable(port: Option<u16>) -> Result<()> {
     enable_internal(port, true).await
 }
 
+/// Enable without printing user-facing output — for background callers like
+/// the fail-open watchdog re-enabling after a recovery.
+pub async fn enable_quiet(port: Option<u16>) -> Result<()> {
+    enable_internal(port, false).await
+}
+
 async fn enable_internal(port: Option<u16>, print_user_output: bool) -> Result<()> {
     let proxy_port = port.unwrap_or(DEFAULT_PROXY_PORT);
     let proxy_addr = format!("127.0.0.1:{proxy_port}");
@@ -320,6 +326,61 @@ pub async fn status() -> Result<bool> {
 
     #[allow(unreachable_code)]
     Ok(false)
+}
+
+/// Is the OS proxy currently enabled *and pointing at soth's own
+/// loopback:port signature*?
+///
+/// This is deliberately stricter than [`status`]: it returns `true` only
+/// when the active system proxy is one we set (loopback host + our port),
+/// never for a foreign loopback tool (Charles, mitmproxy) or a real
+/// upstream proxy. The fail-open watchdog gates on this so it can only ever
+/// clear *soth's* proxy — never strand a user by disabling someone else's.
+///
+/// Best-effort: any read error resolves to `false` (don't act on
+/// uncertainty), which is the safe direction for a function whose `true`
+/// authorizes disabling the proxy.
+pub fn soth_proxy_signature_active(port: u16) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let Ok(services) = get_macos_network_services() else {
+            return false;
+        };
+        return !list_macos_services_using_soth_signature(&services, port).is_empty();
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Only the gsettings-managed path can be inspected reliably; the
+        // env-var fallback isn't a persistent OS setting we can read back.
+        if which::which("gsettings").is_err() || !gnome_proxy_schema_available() {
+            return false;
+        }
+        let mode_manual = get_linux_proxy_mode().as_deref() == Some("manual");
+        let host_loopback = get_linux_proxy_host("https")
+            .map(|host| matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1"))
+            .unwrap_or(false);
+        let port_matches = get_linux_proxy_port("https") == Some(port);
+        return mode_manual && host_loopback && port_matches;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if !read_windows_proxy_enabled().unwrap_or(false) {
+            return false;
+        }
+        let registered = read_windows_string_value("ProxyServer").unwrap_or(None);
+        let registered = registered.unwrap_or_default();
+        let registered = registered.trim();
+        let expected = format!("127.0.0.1:{port}");
+        return registered.starts_with(&expected);
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = port;
+        false
+    }
 }
 
 fn get_ca_path() -> PathBuf {
