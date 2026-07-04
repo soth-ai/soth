@@ -71,6 +71,23 @@ const PROXY_BYPASS_DOMAINS: &[&str] = &[
     "172.29.*",
     "172.30.*",
     "172.31.*",
+    // Link-local (APIPA / point-to-point / some captive gateways).
+    "169.254.*",
+    // CGNAT 100.64.0.0/10 — this is Tailscale's whole address range,
+    // including its MagicDNS resolver at 100.100.100.100. Without this,
+    // tailnet peer traffic and MagicDNS route through soth instead of
+    // direct. CIDR form is honored by macOS/GNOME bypass lists; the
+    // per-/16 globs below give Windows and no_proxy coverage of the busiest
+    // part of the range (Tailscale hands out /10 but clusters low).
+    "100.64.0.0/10",
+    "100.64.*",
+    "100.100.100.100",
+    "*.ts.net",
+    // IPv6 private ranges — only ::1 was covered before, so v6 ULA and
+    // link-local traffic (increasingly common on tethering and mesh nets)
+    // was being proxied. CIDR is honored by macOS/GNOME.
+    "fc00::/7",
+    "fe80::/10",
     // Captive-portal detection — must go direct, not via soth.
     "captive.apple.com",
     "www.apple.com",
@@ -84,6 +101,18 @@ const PROXY_BYPASS_DOMAINS: &[&str] = &[
     "clients4.google.com",
     "nmcheck.gnome.org",
 ];
+
+/// The bypass set rendered for a delimiter-joined target (Windows
+/// `ProxyOverride`, `no_proxy` env vars, KDE `NoProxyFor`). CIDR entries are
+/// kept — matchers that don't understand them simply ignore them, and the
+/// glob forms alongside cover the same ranges on those platforms.
+///
+/// macOS consumes `PROXY_BYPASS_DOMAINS` as a list (not joined), so this is
+/// only referenced on Linux/Windows.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn proxy_bypass_joined(separator: &str) -> String {
+    PROXY_BYPASS_DOMAINS.join(separator)
+}
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,6 +188,27 @@ async fn enable_internal(port: Option<u16>, print_user_output: bool) -> Result<(
     #[cfg(not(target_os = "linux"))]
     let managed_apply = true;
 
+    // Before overwriting the OS proxy, check for a pre-existing config we'd
+    // clobber. On corp/managed networks where the *only* egress is an
+    // upstream proxy or PAC, replacing it with soth (which dials the internet
+    // directly) takes the user fully offline while `soth status` reports
+    // healthy. We can't safely chain through it yet (that's a follow-up), so
+    // warn loudly and record it rather than silently break connectivity.
+    if let Some(conflict) = detect_conflicting_proxy(proxy_port) {
+        warn!(
+            conflict = %conflict,
+            "enabling soth over a pre-existing proxy/PAC configuration; on a proxy-only-egress network this can drop connectivity"
+        );
+        if print_user_output {
+            style::warning(&format!(
+                "A proxy is already configured on this system ({conflict}).\n   \
+                 soth will replace it and connect directly. If this network only allows \
+                 internet access *through* that proxy, you may lose connectivity — run \
+                 `soth off` to restore it."
+            ));
+        }
+    }
+
     if print_user_output {
         println!(
             "{} Configuring system to use SOTH proxy at {}",
@@ -228,6 +278,100 @@ async fn enable_internal(port: Option<u16>, print_user_output: bool) -> Result<(
     }
 
     Ok(())
+}
+
+/// Best-effort detection of a pre-existing proxy configuration soth is about
+/// to overwrite: a manual proxy whose host is **not** our own loopback, or a
+/// PAC / auto-config URL. Returns a short human description, or `None` when
+/// nothing conflicting is set (or on any read error — we never block enable
+/// on a failed probe).
+fn detect_conflicting_proxy(expected_port: u16) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let services = get_macos_network_services().ok()?;
+        for service in &services {
+            // A manual proxy pointing somewhere that isn't our loopback.
+            for secure in [false, true] {
+                if let Ok(snap) = get_macos_proxy_endpoint(service, secure) {
+                    if snap.enabled {
+                        let host = snap.host.as_deref().unwrap_or("");
+                        let is_ours = is_loopback_host(host) && snap.port == Some(expected_port);
+                        if !host.is_empty() && !is_ours {
+                            let kind = if secure { "HTTPS" } else { "HTTP" };
+                            return Some(format!(
+                                "{kind} proxy {host}:{} on \"{service}\"",
+                                snap.port.unwrap_or(0)
+                            ));
+                        }
+                    }
+                }
+            }
+            // A PAC / auto-config URL.
+            if let Some(url) = get_macos_autoproxy_url(service) {
+                return Some(format!("auto-config (PAC) {url} on \"{service}\""));
+            }
+        }
+        None
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if which::which("gsettings").is_err() || !gnome_proxy_schema_available() {
+            return None;
+        }
+        match get_linux_proxy_mode().as_deref() {
+            Some("auto") => {
+                let url = run_gsettings_get("org.gnome.system.proxy", "autoconfig-url")
+                    .and_then(|raw| parse_gsettings_string(&raw))
+                    .unwrap_or_default();
+                Some(format!("GNOME auto-config (PAC) {url}"))
+            }
+            Some("manual") => {
+                let host = get_linux_proxy_host("https").unwrap_or_default();
+                let is_ours = matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1")
+                    && get_linux_proxy_port("https") == Some(expected_port);
+                if !host.is_empty() && !is_ours {
+                    Some(format!(
+                        "GNOME manual proxy {host}:{}",
+                        get_linux_proxy_port("https").unwrap_or(0)
+                    ))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // A PAC / auto-config URL takes precedence over the manual proxy in
+        // WinINET, so flag it first — soth's manual entry won't even apply.
+        if let Ok(Some(url)) = read_windows_string_value("AutoConfigURL") {
+            if !url.trim().is_empty() {
+                return Some(format!("auto-config (PAC) {url}"));
+            }
+        }
+        if read_windows_proxy_enabled().unwrap_or(false) {
+            if let Ok(Some(server)) = read_windows_string_value("ProxyServer") {
+                let server = server.trim();
+                let expected = format!("127.0.0.1:{expected_port}");
+                let is_ours = server.starts_with("127.0.0.1")
+                    || server.starts_with("localhost")
+                    || server.starts_with(&expected);
+                if !server.is_empty() && !is_ours {
+                    return Some(format!("manual proxy {server}"));
+                }
+            }
+        }
+        None
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = expected_port;
+        None
+    }
 }
 
 /// Disable system proxy settings
@@ -885,6 +1029,31 @@ fn get_macos_proxy_endpoint(service: &str, secure: bool) -> Result<ProxyEndpoint
     Ok(parse_macos_proxy_endpoint(&stdout))
 }
 
+/// The service's auto-proxy (PAC) URL if auto-config is enabled, else None.
+/// `networksetup -getautoproxyurl` prints `URL: <url>` and `Enabled: Yes/No`.
+#[cfg(target_os = "macos")]
+fn get_macos_autoproxy_url(service: &str) -> Option<String> {
+    let stdout = run_networksetup_read(&["-getautoproxyurl", service]).ok()?;
+    let mut url: Option<String> = None;
+    let mut enabled = false;
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if let Some(value) = trimmed.strip_prefix("URL:") {
+            let value = value.trim();
+            if !value.is_empty() && !value.eq_ignore_ascii_case("(null)") {
+                url = Some(value.to_string());
+            }
+        } else if let Some(value) = trimmed.strip_prefix("Enabled:") {
+            enabled = value.trim().eq_ignore_ascii_case("yes");
+        }
+    }
+    if enabled {
+        url
+    } else {
+        None
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn restore_macos_proxy_endpoint(
     service: &str,
@@ -994,12 +1163,18 @@ async fn configure_linux_proxy(enable: bool, port: u16, print_user_output: bool)
                  /etc/environment, systemd Environment=...):",
                 style::INFO
             );
+            // no_proxy previously listed only loopback + *.local, so curl /
+            // pip / npm / apt on headless & KDE hosts proxied all RFC1918,
+            // link-local, CGNAT (Tailscale) and v6-private traffic through
+            // soth — breaking LAN, internal registries, and mirrors. Derive
+            // the full bypass set from the single source of truth.
+            let no_proxy = proxy_bypass_joined(",");
             println!("      export https_proxy=\"http://127.0.0.1:{}\"", port);
             println!("      export HTTPS_PROXY=\"http://127.0.0.1:{}\"", port);
             println!("      export http_proxy=\"http://127.0.0.1:{}\"", port);
             println!("      export HTTP_PROXY=\"http://127.0.0.1:{}\"", port);
-            println!("      export no_proxy=\"localhost,127.0.0.1,::1,*.local\"");
-            println!("      export NO_PROXY=\"localhost,127.0.0.1,::1,*.local\"");
+            println!("      export no_proxy=\"{no_proxy}\"");
+            println!("      export NO_PROXY=\"{no_proxy}\"");
         } else {
             println!("   {} Remove from your shell profile:", style::INFO);
             println!("      unset https_proxy HTTPS_PROXY http_proxy HTTP_PROXY no_proxy NO_PROXY");
@@ -1044,9 +1219,10 @@ fn print_kde_manual_instructions(enable: bool, port: u16, tool: &str) {
             "      {tool} --file kioslaverc --group \"Proxy Settings\" --key httpProxy \
              \"http://127.0.0.1:{port}\""
         );
+        let no_proxy = proxy_bypass_joined(",");
         println!(
             "      {tool} --file kioslaverc --group \"Proxy Settings\" --key NoProxyFor \
-             \"localhost,127.0.0.1,::1,*.local\""
+             \"{no_proxy}\""
         );
     } else {
         println!("      {tool} --file kioslaverc --group \"Proxy Settings\" --key ProxyType 0");
@@ -1348,7 +1524,14 @@ async fn check_linux_proxy_status() -> Result<bool> {
 #[cfg(target_os = "windows")]
 async fn configure_windows_proxy(enable: bool, port: u16, print_user_output: bool) -> Result<()> {
     let proxy_server = format!("127.0.0.1:{}", port);
-    let proxy_bypass = "localhost;127.0.0.1;::1;*.local;192.168.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;<local>";
+    // Derived from the single bypass source of truth so Windows gets the same
+    // link-local / CGNAT / captive-portal coverage as macOS/Linux. Previously
+    // this hardcoded string omitted the entire captive-portal allow-list, so
+    // NCSI probes and hotel/airport login pages routed through soth (whose CA
+    // isn't trusted pre-login) and failed. `<local>` (bypass for
+    // single-label hostnames) is appended, matching WinINET convention.
+    let proxy_bypass = format!("{};<local>", proxy_bypass_joined(";"));
+    let proxy_bypass = proxy_bypass.as_str();
 
     if enable {
         if let Some(existing_state) = load_system_proxy_state()? {
@@ -1749,6 +1932,44 @@ mod tests {
         assert!(merged.contains(&"example.com".to_string()));
         assert!(merged.contains(&"localhost".to_string()));
         assert!(merged.contains(&"127.0.0.1".to_string()));
+    }
+
+    #[test]
+    fn bypass_list_covers_private_link_local_cgnat_v6_and_captive() {
+        // Regression guard for the Tier 1.4/1.5 gaps: local, overlay-network,
+        // and captive-portal traffic must all be in the bypass set.
+        for entry in [
+            "127.0.0.1",
+            "10.*",
+            "192.168.*",
+            "172.16.*",
+            "169.254.*",     // link-local
+            "100.64.0.0/10", // CGNAT / Tailscale
+            "*.ts.net",      // Tailscale MagicDNS
+            "fc00::/7",      // v6 ULA
+            "fe80::/10",     // v6 link-local
+            "captive.apple.com",
+            "www.msftconnecttest.com",
+        ] {
+            assert!(
+                PROXY_BYPASS_DOMAINS.contains(&entry),
+                "bypass list is missing {entry}"
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn joined_bypass_includes_rfc1918_and_captive() {
+        // The Linux no_proxy / Windows ProxyOverride derivations previously
+        // dropped RFC1918 (Linux) and the captive list (Windows). Deriving
+        // from the single source keeps them in sync.
+        let joined = proxy_bypass_joined(";");
+        assert!(joined.contains("10.*"));
+        assert!(joined.contains("192.168.*"));
+        assert!(joined.contains("169.254.*"));
+        assert!(joined.contains("captive.apple.com"));
+        assert!(joined.contains("*.ts.net"));
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
