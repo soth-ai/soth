@@ -98,7 +98,13 @@ impl Default for ForwardProxyConfig {
             // response. 120s gives streaming LLM responses the headroom
             // they need without hiding genuinely-stuck upstreams.
             upstream_timeout: DurationSetting::millis(120_000),
-            upstream_retry_on_failure: false,
+            // On by default: a single retry (after upstream_retry_delay, bounded
+            // by the connect deadline) for transient connect failures — refused
+            // / unreachable / reset — which are routine during hotspot handoffs
+            // and gateway blips. Without it a single blip surfaces to the user
+            // as a 502. The retry only fires on transient errors, never on
+            // timeouts, so it can't mask a genuinely-stuck upstream.
+            upstream_retry_on_failure: true,
             upstream_retry_delay: DurationSetting::millis(200),
             capture_max_body_bytes: 64 * 1024 * 1024,
             buffer_request_bodies: true,

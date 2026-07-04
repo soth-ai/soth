@@ -264,7 +264,10 @@ impl Default for MitmRuntimeConfig {
             h2_body_idle_timeout_ms: 60_000,
             h2_response_overflow_mode: H2ResponseOverflowModeConfig::TruncateContinue,
             upstream_connect_timeout_ms: 5_000,
-            upstream_retry_on_failure: false,
+            // On by default (matches the CLI-generated config): one retry for
+            // transient connect failures during hotspot/gateway blips; never
+            // retries timeouts.
+            upstream_retry_on_failure: true,
             upstream_retry_delay_ms: 200,
             verify_upstream_tls: true,
             max_connections_per_host: 64,
