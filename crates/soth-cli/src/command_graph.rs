@@ -1141,9 +1141,9 @@ async fn ensure_config_for_up(
         }
     }
 
-    let init_output = dirs::home_dir()
-        .map(|home| home.join(".soth"))
-        .unwrap_or_else(|| PathBuf::from(".soth"));
+    // Route through expand_tilde so the env-aware home resolution applies
+    // (dirs::home_dir() ignores $HOME on Windows; see cli_config::home_dir).
+    let init_output = cli_config::expand_tilde(Path::new("~/.soth"));
     if !quiet {
         style::info(&format!(
             "No config found. Bootstrapping runtime in {}",
