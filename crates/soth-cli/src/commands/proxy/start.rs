@@ -872,9 +872,31 @@ async fn proxy_health_watchdog_loop(expected_port: u16) {
     loop {
         ticker.tick().await;
 
-        if is_local_listener_ready(expected_port) {
+        // Both probes are synchronous and can block (a 500ms connect; several
+        // subprocess reads for the signature). Run them off the async workers
+        // so a per-tick block can't starve the supervisor on a small runtime.
+        // A join failure (a panic in the probe) resolves to "not ready" /
+        // "not ours" — the safe direction, since neither authorizes a disable.
+        let listener_ready =
+            tokio::task::spawn_blocking(move || is_local_listener_ready(expected_port))
+                .await
+                .unwrap_or(false);
+
+        if listener_ready {
             dead_ticks = 0;
             if disabled_by_watchdog {
+                // Respect an explicit `soth off` issued during the outage: if
+                // the user turned the proxy off, do not re-enable it behind
+                // their back — stop trying and leave it off.
+                if super::system::user_disabled_proxy() {
+                    info!(
+                        port = expected_port,
+                        "listener recovered but the user disabled the proxy (soth off) — not re-enabling"
+                    );
+                    disabled_by_watchdog = false;
+                    ready_ticks = 0;
+                    continue;
+                }
                 ready_ticks = ready_ticks.saturating_add(1);
                 if ready_ticks >= WATCHDOG_RECOVER_TICKS {
                     info!(
@@ -908,7 +930,12 @@ async fn proxy_health_watchdog_loop(expected_port: u16) {
 
         // Sustained dead listener. Only act if the OS proxy still points at
         // us — otherwise there's nothing of ours to clear.
-        if !super::system::soth_proxy_signature_active(expected_port) {
+        let signature_active = tokio::task::spawn_blocking(move || {
+            super::system::soth_proxy_signature_active(expected_port)
+        })
+        .await
+        .unwrap_or(false);
+        if !signature_active {
             continue;
         }
         warn!(
