@@ -49,6 +49,18 @@ struct SyncStatusJson {
     failed: u64,
     #[serde(skip_serializing)]
     endpoint: String,
+    /// Last heartbeat rejection (e.g. a 403 org/identity mismatch), if the
+    /// most recent heartbeat was rejected by the cloud. Cleared on the next
+    /// accepted heartbeat.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    heartbeat_rejection: Option<HeartbeatRejectionJson>,
+}
+
+#[derive(Debug, Serialize)]
+struct HeartbeatRejectionJson {
+    status: u16,
+    message: String,
+    rejected_secs_ago: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -99,7 +111,8 @@ pub async fn run(config_path: Option<PathBuf>, json: bool) -> Result<bool> {
         && proxy.ca_valid_until.is_some()
         && ca_trusted
         && !runtime_degraded
-        && (!config.cloud.enabled || sync.failed == 0);
+        && (!config.cloud.enabled
+            || (sync.failed == 0 && sync.heartbeat_rejection.is_none()));
 
     let payload = StatusJson {
         proxy,
@@ -237,6 +250,19 @@ fn render_human(status: &StatusJson) {
         status.sync.queued, status.sync.failed
     );
     println!("Endpoint:       {}", status.sync.endpoint);
+    if let Some(rejection) = status.sync.heartbeat_rejection.as_ref() {
+        let ago = rejection
+            .rejected_secs_ago
+            .map(format_ago)
+            .unwrap_or_else(|| "recently".to_string());
+        println!(
+            "Heartbeat:      REJECTED (HTTP {}, {}) — {}",
+            rejection.status, ago, rejection.message
+        );
+        println!(
+            "                Fix: re-enroll this device — `soth enroll --new-device-id <token>`"
+        );
+    }
     println!();
     println!("LAST 24 HOURS");
     println!("----------------------------------------");
@@ -264,6 +290,9 @@ fn render_human(status: &StatusJson) {
         }
         if proxy_runtime_degraded(&status.proxy) {
             reasons.push("bundle runtime degraded");
+        }
+        if status.sync.heartbeat_rejection.is_some() {
+            reasons.push("cloud heartbeat rejected (re-enroll)");
         }
         if reasons.is_empty() {
             style::warning("degraded");
@@ -467,6 +496,23 @@ fn collect_sync_status(
     let last_sync =
         read_sync_state(conn, "last_sync_timestamp")?.and_then(|value| parse_sync_age(&value, now));
 
+    // Surface the last heartbeat rejection (e.g. a 403 org mismatch) so a
+    // "Last heartbeat: never" line isn't the only signal. Only meaningful
+    // when cloud sync is enabled; best-effort read (a corrupt sidecar just
+    // yields None rather than failing the whole status command).
+    let heartbeat_rejection = if config.cloud.enabled {
+        soth_sync::heartbeat_rejection::read()
+            .ok()
+            .flatten()
+            .map(|r| HeartbeatRejectionJson {
+                status: r.status,
+                message: summarize_status_line(&r.message, 200),
+                rejected_secs_ago: seconds_since_epoch(r.rejected_at, now),
+            })
+    } else {
+        None
+    };
+
     Ok(SyncStatusJson {
         last_heartbeat_secs: last_sync,
         queued,
@@ -474,7 +520,14 @@ fn collect_sync_status(
         // Sync/heartbeat targets the ingest endpoint; report the actual URL
         // the runtime is using so `soth status` reflects the live wire.
         endpoint: config.cloud.resolved_ingest_endpoint(),
+        heartbeat_rejection,
     })
+}
+
+/// Whole seconds between a Unix-epoch timestamp and `now`, clamped at 0.
+fn seconds_since_epoch(epoch_secs: u64, now: DateTime<Utc>) -> Option<i64> {
+    let then = Utc.timestamp_opt(epoch_secs as i64, 0).single()?;
+    Some((now - then).num_seconds().max(0))
 }
 
 fn collect_last_24h(conn: &rusqlite::Connection, now: DateTime<Utc>) -> Result<Last24hJson> {
