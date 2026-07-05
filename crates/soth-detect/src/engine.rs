@@ -446,10 +446,11 @@ fn parse_request(
 
     if normalized.estimated_cost_usd <= 0.0 {
         if let Some(estimated_cost) = provider_entry.and_then(|entry| {
-            estimate_input_cost_usd(
+            estimate_cost_usd(
                 entry,
                 normalized.model.as_deref(),
                 normalized.estimated_input_tokens,
+                normalized.estimated_output_tokens,
             )
         }) {
             normalized.estimated_cost_usd = estimated_cost as f64;
@@ -1153,31 +1154,62 @@ fn provider_entry_for<'a>(
     })
 }
 
-fn estimate_input_cost_usd(
+fn estimate_cost_usd(
     provider_entry: &ProviderEntry,
     model: Option<&str>,
     estimated_input_tokens: u32,
+    estimated_output_tokens: Option<u32>,
 ) -> Option<f32> {
-    if estimated_input_tokens == 0 {
+    let output_tokens = estimated_output_tokens.unwrap_or(0);
+    if estimated_input_tokens == 0 && output_tokens == 0 {
         return Some(0.0);
     }
 
     let pricing = provider_entry.pricing.as_ref()?;
-    let usd_per_input_token = model
-        .and_then(|model_id| extract_model_rate(pricing, model_id))
-        .or_else(|| extract_model_rate(pricing, "default"))
-        .or_else(|| extract_input_rate(pricing))?;
 
-    Some((estimated_input_tokens as f64 * usd_per_input_token) as f32)
+    // Input side uses the same rate resolution as before: model-specific rate,
+    // then a "default" model entry, then the provider-level rate.
+    let usd_per_input_token = model
+        .and_then(|model_id| extract_model_rate(pricing, model_id, extract_input_rate))
+        .or_else(|| extract_model_rate(pricing, "default", extract_input_rate))
+        .or_else(|| extract_input_rate(pricing));
+
+    // Output tokens are typically billed at a higher rate; price them with the
+    // model's output/completion rate resolved from the same pricing registry.
+    let usd_per_output_token = model
+        .and_then(|model_id| extract_model_rate(pricing, model_id, extract_output_rate))
+        .or_else(|| extract_model_rate(pricing, "default", extract_output_rate))
+        .or_else(|| extract_output_rate(pricing));
+
+    // If neither side can be priced, there is no estimate to report.
+    if usd_per_input_token.is_none() && usd_per_output_token.is_none() {
+        return None;
+    }
+
+    // Price what we can: a missing rate on one side contributes nothing rather
+    // than discarding the whole estimate. This keeps the estimate best-effort
+    // (still just an estimate) while now including output-token spend.
+    let input_cost = usd_per_input_token
+        .map(|rate| estimated_input_tokens as f64 * rate)
+        .unwrap_or(0.0);
+    let output_cost = usd_per_output_token
+        .map(|rate| output_tokens as f64 * rate)
+        .unwrap_or(0.0);
+
+    Some((input_cost + output_cost) as f32)
 }
 
-fn extract_model_rate(pricing: &JsonValue, model_id: &str) -> Option<f64> {
+fn extract_model_rate(
+    pricing: &JsonValue,
+    model_id: &str,
+    extract_rate: fn(&JsonValue) -> Option<f64>,
+) -> Option<f64> {
     let model_value = lookup_case_insensitive(pricing, model_id).or_else(|| {
         pricing
             .get("models")
             .and_then(|models| lookup_case_insensitive(models, model_id))
     })?;
-    extract_input_rate(model_value)
+    extract_rate(model_value)
 }
 
 fn lookup_case_insensitive<'a>(node: &'a JsonValue, key: &str) -> Option<&'a JsonValue> {
@@ -1231,6 +1263,52 @@ fn extract_input_rate(node: &JsonValue) -> Option<f64> {
             return Some(value / 1_000.0);
         }
         if let Some(value) = input.get("per_token_usd").and_then(JsonValue::as_f64) {
+            return Some(value);
+        }
+    }
+
+    None
+}
+
+fn extract_output_rate(node: &JsonValue) -> Option<f64> {
+    const PER_MILLION_KEYS: [&str; 4] = [
+        "output_per_million_usd",
+        "completion_per_million_usd",
+        "output_usd_per_million",
+        "completion_usd_per_million",
+    ];
+    const PER_K_KEYS: [&str; 4] = [
+        "output_per_1k_usd",
+        "completion_per_1k_usd",
+        "output_usd_per_1k",
+        "completion_usd_per_1k",
+    ];
+    const PER_TOKEN_KEYS: [&str; 2] = ["output_per_token_usd", "completion_per_token_usd"];
+
+    for key in PER_MILLION_KEYS {
+        if let Some(value) = node.get(key).and_then(JsonValue::as_f64) {
+            return Some(value / 1_000_000.0);
+        }
+    }
+    for key in PER_K_KEYS {
+        if let Some(value) = node.get(key).and_then(JsonValue::as_f64) {
+            return Some(value / 1_000.0);
+        }
+    }
+    for key in PER_TOKEN_KEYS {
+        if let Some(value) = node.get(key).and_then(JsonValue::as_f64) {
+            return Some(value);
+        }
+    }
+
+    if let Some(output) = node.get("output") {
+        if let Some(value) = output.get("per_million_usd").and_then(JsonValue::as_f64) {
+            return Some(value / 1_000_000.0);
+        }
+        if let Some(value) = output.get("per_1k_usd").and_then(JsonValue::as_f64) {
+            return Some(value / 1_000.0);
+        }
+        if let Some(value) = output.get("per_token_usd").and_then(JsonValue::as_f64) {
             return Some(value);
         }
     }
@@ -1337,5 +1415,83 @@ fn emit_intelligence(req: &RawRequest, result: &ParseDetectResult, sink: &dyn In
 
     if let Some(record) = extract_unknown_graphql_operation_record(req, result, parse_event_id) {
         let _ = sink.record_unknown_graphql_operation(&record);
+    }
+}
+
+#[cfg(test)]
+mod cost_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn provider_with_pricing(pricing: JsonValue) -> ProviderEntry {
+        ProviderEntry {
+            pricing: Some(pricing),
+            ..Default::default()
+        }
+    }
+
+    fn approx(actual: f32, expected: f64) {
+        assert!(
+            ((actual as f64) - expected).abs() < 1e-6,
+            "expected ~{expected}, got {actual}"
+        );
+    }
+
+    // gpt-4o: input 5.0/M, output 15.0/M.
+    fn gpt4o_pricing() -> ProviderEntry {
+        provider_with_pricing(json!({
+            "gpt-4o": {
+                "input_per_million_usd": 5.0,
+                "output_per_million_usd": 15.0,
+            }
+        }))
+    }
+
+    #[test]
+    fn prices_output_tokens_in_addition_to_input() {
+        let entry = gpt4o_pricing();
+
+        // Input only: 1000 * 5/1e6 = 0.005
+        let input_only = estimate_cost_usd(&entry, Some("gpt-4o"), 1_000, None).unwrap();
+        approx(input_only, 0.005);
+
+        // Input + output: 0.005 + 2000 * 15/1e6 (= 0.03) = 0.035
+        let with_output = estimate_cost_usd(&entry, Some("gpt-4o"), 1_000, Some(2_000)).unwrap();
+        approx(with_output, 0.035);
+
+        // Output tokens must strictly increase the estimate.
+        assert!(
+            with_output > input_only,
+            "output tokens should raise the estimate: {with_output} vs {input_only}"
+        );
+    }
+
+    #[test]
+    fn output_only_is_priced_when_input_is_zero() {
+        let entry = gpt4o_pricing();
+        // 3000 output tokens * 15/1e6 = 0.045, no input.
+        let cost = estimate_cost_usd(&entry, Some("gpt-4o"), 0, Some(3_000)).unwrap();
+        approx(cost, 0.045);
+    }
+
+    #[test]
+    fn missing_output_rate_still_prices_input_without_crashing() {
+        // Provider publishes only an input rate; output rate is unknown.
+        let entry = provider_with_pricing(json!({
+            "gpt-4o": { "input_per_million_usd": 5.0 }
+        }));
+        let cost = estimate_cost_usd(&entry, Some("gpt-4o"), 1_000, Some(2_000)).unwrap();
+        // Output contributes nothing because no output rate is available.
+        approx(cost, 0.005);
+    }
+
+    #[test]
+    fn zero_tokens_yields_zero_cost() {
+        let entry = gpt4o_pricing();
+        approx(estimate_cost_usd(&entry, Some("gpt-4o"), 0, None).unwrap(), 0.0);
+        approx(
+            estimate_cost_usd(&entry, Some("gpt-4o"), 0, Some(0)).unwrap(),
+            0.0,
+        );
     }
 }
