@@ -46,6 +46,13 @@ pub struct EnrollArgs {
     /// Optional machine name override sent during enrollment
     #[arg(long)]
     pub machine_name: Option<String>,
+
+    /// Regenerate the client device id before enrolling. Use this when a
+    /// prior enrollment left a stale device_id that the cloud now rejects
+    /// (heartbeat 403 org/identity mismatch): the default enroll reuses the
+    /// persisted device_id, which reproduces the same rejection.
+    #[arg(long)]
+    pub new_device_id: bool,
 }
 
 pub async fn run(args: EnrollArgs, global_config: Option<PathBuf>) -> Result<()> {
@@ -84,7 +91,17 @@ pub async fn run(args: EnrollArgs, global_config: Option<PathBuf>) -> Result<()>
         .machine_name
         .clone()
         .unwrap_or_else(default_machine_name);
-    let enrollment_device_id = cli_config::sync_client_device_id(&mut config, None)?;
+    // `--new-device-id` forces a brand-new identity so the exchange (and the
+    // heartbeats that follow) register a fresh device rather than reusing a
+    // stale, cloud-rejected one. Without it, sync_client_device_id reuses the
+    // persisted id.
+    let enrollment_device_id = if args.new_device_id {
+        let regenerated = cli_config::regenerate_client_device_id(&mut config)?;
+        println!("Regenerated client device ID: {regenerated}");
+        regenerated
+    } else {
+        cli_config::sync_client_device_id(&mut config, None)?
+    };
     let enrollment_proxy_public_key = proxy_public_key_base64(enrollment_device_id.as_str());
 
     let response_json = exchange_enroll_token(

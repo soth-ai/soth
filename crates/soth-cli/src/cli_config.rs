@@ -1127,8 +1127,89 @@ pub fn sync_client_device_id(
     Ok(device_id)
 }
 
+/// Force-generate a fresh client device id, overwriting any persisted one
+/// in both the config tags and the on-disk `device_id` file. Used by
+/// `soth enroll --new-device-id` as the escape hatch when the cloud has
+/// rejected the stale device_id (e.g. after an org migration): reusing the
+/// old id would just reproduce the same 403.
+pub fn regenerate_client_device_id(config: &mut SothConfig) -> Result<String> {
+    let device_id = format!("device-{}", Uuid::new_v4());
+    config
+        .cloud
+        .tags
+        .insert("device_id".to_string(), device_id.clone());
+    write_client_device_id(&device_id)?;
+    Ok(device_id)
+}
+
 pub fn resolved_db_path(config: &SothConfig) -> PathBuf {
     expand_tilde(Path::new(config.proxy.db_path.as_str()))
+}
+
+#[cfg(test)]
+mod device_id_tests {
+    use super::{regenerate_client_device_id, SothConfig};
+    use std::env;
+
+    /// Run `f` with HOME (and the Windows/soth-specific home vars) pointed at
+    /// a throwaway tempdir so device_id file writes stay sandboxed.
+    fn with_temp_home<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = crate::commands::proxy::lock_test_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let old_home = env::var_os("HOME");
+        let old_userprofile = env::var_os("USERPROFILE");
+        let old_soth_home = env::var_os("SOTH_HOME_DIR");
+        unsafe {
+            env::set_var("HOME", temp.path());
+            env::set_var("USERPROFILE", temp.path());
+            env::set_var("SOTH_HOME_DIR", temp.path().join(".soth"));
+        }
+        let result = f();
+        match old_home {
+            Some(v) => unsafe { env::set_var("HOME", v) },
+            None => unsafe { env::remove_var("HOME") },
+        }
+        match old_userprofile {
+            Some(v) => unsafe { env::set_var("USERPROFILE", v) },
+            None => unsafe { env::remove_var("USERPROFILE") },
+        }
+        match old_soth_home {
+            Some(v) => unsafe { env::set_var("SOTH_HOME_DIR", v) },
+            None => unsafe { env::remove_var("SOTH_HOME_DIR") },
+        }
+        result
+    }
+
+    #[test]
+    fn regenerate_replaces_stale_device_id_tag() {
+        with_temp_home(|| {
+            let mut config = SothConfig::default();
+            config
+                .cloud
+                .tags
+                .insert("device_id".to_string(), "device-stale".to_string());
+
+            let fresh = regenerate_client_device_id(&mut config).expect("regenerate");
+
+            assert!(fresh.starts_with("device-"), "id has device- prefix");
+            assert_ne!(fresh, "device-stale", "stale id was replaced");
+            assert_eq!(
+                config.cloud.tags.get("device_id").map(String::as_str),
+                Some(fresh.as_str()),
+                "config tag reflects the fresh id"
+            );
+        });
+    }
+
+    #[test]
+    fn regenerate_yields_distinct_ids() {
+        with_temp_home(|| {
+            let mut config = SothConfig::default();
+            let first = regenerate_client_device_id(&mut config).expect("first");
+            let second = regenerate_client_device_id(&mut config).expect("second");
+            assert_ne!(first, second, "each regenerate produces a fresh id");
+        });
+    }
 }
 
 #[cfg(test)]

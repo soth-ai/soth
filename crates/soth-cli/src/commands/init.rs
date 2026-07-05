@@ -25,8 +25,8 @@ pub async fn run(output: PathBuf) -> Result<()> {
     println!();
     println!("Next steps:");
     println!("  1. soth setup-ca");
-    println!("  2. soth start");
-    println!("  3. soth on");
+    println!("  2. soth enroll <token>   (cloud-managed only; skip for standalone)");
+    println!("  3. soth up               (or: soth start && soth on)");
     println!("  4. soth status");
     Ok(())
 }

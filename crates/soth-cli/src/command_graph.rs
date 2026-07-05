@@ -18,9 +18,29 @@ pub struct GlobalOptions {
     pub verbose: bool,
 }
 
+/// GETTING STARTED block appended to `soth --help`. Puts the one-shot
+/// `soth up` bootstrap front and centre so first-time users don't have to
+/// reverse-engineer the golden path from the flat subcommand list.
+const AFTER_HELP: &str = "\
+GETTING STARTED:
+  Standalone (local-only):
+    soth setup-ca          Generate + trust the local MITM CA (one time)
+    soth up                One-shot bootstrap: init -> CA -> start -> enable proxy
+    soth status            Confirm the daemon is healthy
+
+  Cloud-managed (team policy + telemetry):
+    soth setup-ca          Generate + trust the local MITM CA (one time)
+    soth enroll <token>    Exchange an invite token for cloud credentials
+    soth up                Bootstrap and start under cloud policy
+    soth status            Confirm the daemon + cloud heartbeat are healthy
+
+  Already enrolled? `soth up --token <token>` folds enrollment into bootstrap.
+  Tear down with `soth down` (stop daemon + disable system proxy).";
+
 #[derive(Parser)]
 #[command(name = "soth")]
 #[command(author, version, about, long_about = None)]
+#[command(after_help = AFTER_HELP)]
 pub struct Cli {
     #[command(flatten)]
     pub global: GlobalOptions,
@@ -31,17 +51,17 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// One-shot bootstrap (start here): init -> CA -> start -> enable proxy
+    Up(UpArgs),
+
+    /// stop + off (tear down: stop daemon and disable system proxy)
+    Down,
+
     /// Start the proxy daemon
     Start(StartArgs),
 
     /// Stop the proxy daemon
     Stop,
-
-    /// One-shot bootstrap: init -> CA -> start -> on
-    Up(UpArgs),
-
-    /// stop + off
-    Down,
 
     /// Enable system proxy
     On(OnArgs),
@@ -836,6 +856,7 @@ async fn run_up_command(args: UpArgs, global_config: Option<PathBuf>) -> anyhow:
                 from_stdin: false,
                 non_interactive: true,
                 machine_name: args.machine_name,
+                new_device_id: false,
             },
             effective_config.clone(),
         )

@@ -19,8 +19,27 @@ struct DoctorReport {
     daemon: DaemonDiagnostics,
     system_proxy: SystemProxyDiagnostics,
     ca: CaDiagnostics,
+    cloud: CloudDiagnostics,
     loopback_bindings: LoopbackBindings,
     findings: Vec<DoctorFinding>,
+}
+
+#[derive(Debug, Serialize)]
+struct CloudDiagnostics {
+    /// Whether cloud sync is enabled in config. When false the whole
+    /// section is informational (standalone mode heartbeats nothing).
+    enabled: bool,
+    /// The last heartbeat rejection, if the most recent heartbeat was
+    /// rejected by the cloud (e.g. a 403 org/identity mismatch).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    heartbeat_rejection: Option<CloudRejection>,
+}
+
+#[derive(Debug, Serialize)]
+struct CloudRejection {
+    status: u16,
+    message: String,
+    rejected_at_unix_secs: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -354,6 +373,33 @@ pub async fn run(config_path: Option<PathBuf>, json: bool) -> Result<()> {
     }
 
     println!();
+    println!("CLOUD");
+    println!("----------------------------------------");
+    println!(
+        "Sync enabled:   {}",
+        if report.cloud.enabled {
+            "yes"
+        } else {
+            "no (standalone)"
+        }
+    );
+    match report.cloud.heartbeat_rejection.as_ref() {
+        Some(rejection) => {
+            println!(
+                "Heartbeat:      REJECTED (HTTP {}) — {}",
+                rejection.status, rejection.message
+            );
+            println!(
+                "Fix:            re-enroll this device — `soth enroll --new-device-id <token>`"
+            );
+        }
+        None if report.cloud.enabled => {
+            println!("Heartbeat:      no rejection recorded");
+        }
+        None => {}
+    }
+
+    println!();
     println!("LOOPBACK");
     println!("----------------------------------------");
     println!("Expected port:  {}", report.loopback_bindings.expected_port);
@@ -560,11 +606,32 @@ fn build_report(config_path: Option<PathBuf>) -> DoctorReport {
         details,
     };
 
+    // Cloud/auth: surface the last heartbeat rejection so an org/identity
+    // mismatch (403) is diagnosable here, not just a silent daemon warn.
+    // Only meaningful when cloud sync is enabled; best-effort read.
+    let heartbeat_rejection = if config.cloud.enabled {
+        soth_sync::heartbeat_rejection::read()
+            .ok()
+            .flatten()
+            .map(|r| CloudRejection {
+                status: r.status,
+                message: r.message,
+                rejected_at_unix_secs: r.rejected_at,
+            })
+    } else {
+        None
+    };
+    let cloud = CloudDiagnostics {
+        enabled: config.cloud.enabled,
+        heartbeat_rejection,
+    };
+
     let mut report = DoctorReport {
         managed_runtime,
         daemon,
         system_proxy,
         ca,
+        cloud,
         loopback_bindings,
         findings: Vec::new(),
     };
@@ -645,6 +712,21 @@ fn compute_findings(report: &DoctorReport) -> Vec<DoctorFinding> {
                         .to_string(),
             });
         }
+    }
+
+    if let Some(rejection) = report.cloud.heartbeat_rejection.as_ref() {
+        findings.push(DoctorFinding {
+            level: "error".to_string(),
+            code: "cloud_heartbeat_rejected".to_string(),
+            message: format!(
+                "Cloud rejected the last heartbeat (HTTP {}): {}",
+                rejection.status, rejection.message
+            ),
+            remediation:
+                "Re-enroll this device with a fresh identity: `soth enroll --new-device-id <token>` \
+                 (a 403 usually means the persisted device_id belongs to a different org)."
+                    .to_string(),
+        });
     }
 
     if report.system_proxy.state_file.exists && !report.system_proxy.owner_file.exists {
@@ -1148,6 +1230,10 @@ mod tests {
                 os_trust_status: None,
                 os_trust_detail: None,
             },
+            cloud: CloudDiagnostics {
+                enabled: false,
+                heartbeat_rejection: None,
+            },
             loopback_bindings: LoopbackBindings {
                 expected_port: 8080,
                 local_listener_open,
@@ -1193,5 +1279,31 @@ mod tests {
         let findings = compute_findings(&report);
         assert!(!findings.iter().any(|f| f.code == "listener_not_open"));
         assert!(!findings.iter().any(|f| f.code == "dangling_system_proxy"));
+    }
+
+    #[test]
+    fn heartbeat_rejection_produces_reenroll_finding() {
+        let mut report = report_for_findings(true, true);
+        report.cloud.enabled = true;
+        report.cloud.heartbeat_rejection = Some(CloudRejection {
+            status: 403,
+            message: "org mismatch".to_string(),
+            rejected_at_unix_secs: 1_700_000_000,
+        });
+        let findings = compute_findings(&report);
+        let finding = findings
+            .iter()
+            .find(|f| f.code == "cloud_heartbeat_rejected")
+            .expect("cloud_heartbeat_rejected finding");
+        assert_eq!(finding.level, "error");
+        assert!(finding.message.contains("403"));
+        assert!(finding.remediation.contains("--new-device-id"));
+    }
+
+    #[test]
+    fn no_heartbeat_rejection_produces_no_cloud_finding() {
+        let report = report_for_findings(true, true);
+        let findings = compute_findings(&report);
+        assert!(!findings.iter().any(|f| f.code == "cloud_heartbeat_rejected"));
     }
 }

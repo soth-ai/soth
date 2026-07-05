@@ -23,6 +23,7 @@ pub mod config_puller;
 pub mod db;
 pub mod exchange;
 pub mod heartbeat;
+pub mod heartbeat_rejection;
 pub mod http_client;
 pub mod metadata_pusher;
 pub mod registry_puller;
